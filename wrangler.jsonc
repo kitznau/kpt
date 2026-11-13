@@ -5,7 +5,7 @@
    * timetable ingestion and declares KV storage bindings.
    */
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "kyiv-transport-tracker",
+  "name": "kpt",
   "main": "worker.js",
   "compatibility_date": "2024-01-01",
   "triggers": {
