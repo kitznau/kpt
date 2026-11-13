@@ -1,0 +1,14 @@
+{
+  /**
+   * Cloudflare Workers Configuration (wrangler.jsonc)
+   * Educational note: wrangler.jsonc provides type-checked JSON schema validation 
+   * and allows inline documentation comments for configuration settings.
+   */
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "kyiv-transport-tracker",
+  "main": "worker.js",
+  "compatibility_date": "2024-01-01",
+  "observability": {
+    "enabled": true
+  }
+}
