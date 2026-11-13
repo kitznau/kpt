@@ -4,7 +4,13 @@
  * Cloudflare Worker: Kyiv GTFS Static & Real-time Transit Tracker
  * 
  * Educational Architecture Overview:
- * 
+ * 1. Hybrid Ingestion Pipeline:
+ *    - Scheduled Cron Triggers (scheduled handler) execute daily off-peak ingestion of GTFS Static tables.
+ *    - Edge KV (TRANSPORT_KV) serves pre-indexed stops and timetables with sub-millisecond latency.
+ * 2. Real-Time Telemetry & Distance (fetch handler):
+ *    - Ingests active vehicle telemetry via Kyivpastrans vehiclePosition API (port 8002).
+ *    - Employs the Haversine formula to calculate Euclidean-geodesic proximity to target transit stops.
+ *    - Dynamically computes ETA in minutes based on real-time transit velocity vectors.
  */
 
 // Production API endpoints and operational constants
