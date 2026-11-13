@@ -1,8 +1,8 @@
 {
   /**
    * Cloudflare Workers Configuration (wrangler.jsonc)
-   * Educational note: Configures scheduled Cron triggers for automated daily GTFS Static 
-   * timetable ingestion and declares KV storage bindings.
+   * Educational note: Runs in lightweight Edge execution mode without requiring 
+   * external KV namespace provisioning, utilizing native Cloudflare Edge Cache API.
    */
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "kpt",
@@ -10,16 +10,9 @@
   "compatibility_date": "2024-01-01",
   "triggers": {
     "crons": [
-      // Daily automated synchronization at 03:00 UTC (during low transit frequency hours)
       "0 3 * * *"
     ]
   },
-  "kv_namespaces": [
-    {
-      "binding": "TRANSPORT_KV",
-      "id": "kyiv_transport_kv_production"
-    }
-  ],
   "observability": {
     "enabled": true
   }
