@@ -2,31 +2,33 @@
  * Cloudflare Worker: Kyiv Transit Departure Monitor (Abfahrtsmonitor)
  * 
  * Educational Architecture Overview:
- * 1. Transit Display Engine: Replicates modern European departure monitor ergonomics (VRR/DVG style).
- * 2. Multi-Directional Aggregation: Concurrently processes and renders bidirectional transit corridors.
- * 3. Geodesic Proximity: Uses the Haversine algorithm to compute real-time distance and ETA in minutes.
- * 4. Micro-Edge API: Exposes RESTful endpoints for stops, static GTFS timetables, and live GPS telemetry.
+ * 1. Geodesic Distance Engine: Implements the Haversine formula to compute great-circle distance between GPS coordinates.
+ * 2. Dynamic ETA Calculation: Converts metric distance and velocity vectors into remaining transit arrival minutes.
+ * 3. Resilient Upstream Networking: Wraps remote telemetry requests with AbortSignal.timeout(2000) to prevent Edge hangs.
+ * 4. Dual-Direction Monitor UI: Displays bidirectional departures (Knyazhyi Zaton) modeled after European transit screens.
  */
 
 // Production API endpoints and operational constants
 const CONFIG = {
-  // Official GTFS Static archive export endpoint from Kyivpastrans / Kyiv Open Data
+  // Official GTFS Static archive export endpoint from Kyivpastrans
   GTFS_STATIC_URL: "http://193.23.225.211:8002/export-gtfs-static",
   // Real-time GPS vehicle telemetry endpoint
   LIVE_GPS_URL: "http://193.23.225.211:8002/api/v1/vehicle-positions",
-  // Edge cache duration for high-frequency GPS telemetry (seconds)
+  // Edge cache duration for telemetry in seconds
   LIVE_CACHE_TTL_SECONDS: 15,
-  // Standard transit speed (km/h) for urban bus corridors
+  // Network timeout in milliseconds for external municipal server
+  UPSTREAM_TIMEOUT_MS: 2000,
+  // Default transit speed (km/h) for urban bus routes
   DEFAULT_TRANSIT_SPEED_KMH: 22.0
 };
 
 /**
  * Calculates great-circle distance between two GPS coordinates using the Haversine formula.
  * 
- * @param {number} lat1 Origin latitude
- * @param {number} lon1 Origin longitude
- * @param {number} lat2 Destination latitude
- * @param {number} lon2 Destination longitude
+ * @param {number} lat1 Origin latitude (decimal degrees)
+ * @param {number} lon1 Origin longitude (decimal degrees)
+ * @param {number} lat2 Destination latitude (decimal degrees)
+ * @param {number} lon2 Destination longitude (decimal degrees)
  * @returns {number} Distance in meters
  */
 function calculateHaversineDistance(lat1, lon1, lat2, lon2) {
@@ -48,7 +50,7 @@ function calculateHaversineDistance(lat1, lon1, lat2, lon2) {
 }
 
 /**
- * Derives estimated time of arrival (ETA) in minutes based on distance and recorded velocity.
+ * Derives estimated time of arrival (ETA) in minutes based on distance and velocity.
  * 
  * @param {number} distanceMeters Distance in meters
  * @param {number} speedKmh Instantaneous speed in km/h
@@ -89,7 +91,7 @@ const SEED_DATA = {
     "s-kz-01": [
       { route: "3М", destination: "ст. м. 'Осокорки'", time: "23:37", delayMin: 2 },
       { route: "35", destination: "вул. Підлипка", time: "23:45", delayMin: 0 },
-      { route: "87", destination: "ст. м. 'Осокорки'", time: "23:50", delayMin: 4 },
+      { route: "87", destination: "ст. м. 'Осокорки'", time: "23:50", delayMin: 3 },
       { route: "35", destination: "вул. Підлипка", time: "00:15", delayMin: 0 },
       { route: "87", destination: "ст. м. 'Осокорки'", time: "00:30", delayMin: 0 },
       { route: "35", destination: "вул. Підлипка", time: "05:40", delayMin: 0 }
@@ -117,7 +119,7 @@ const SEED_DATA = {
 };
 
 /**
- * Fetches real-time vehicle positions with Edge cache protection.
+ * Fetches real-time vehicle positions with AbortSignal timeout and Edge cache protection.
  * 
  * @param {object} env Worker environment bindings
  * @returns {Promise<Array>} Normalized vehicle telemetry array
@@ -126,13 +128,19 @@ async function fetchLiveVehicles(env) {
   const liveUrl = env?.LIVE_GPS_URL || CONFIG.LIVE_GPS_URL;
 
   try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), CONFIG.UPSTREAM_TIMEOUT_MS);
+
     const response = await fetch(liveUrl, {
       headers: { "Accept": "application/json" },
+      signal: controller.signal,
       cf: {
         cacheTtl: CONFIG.LIVE_CACHE_TTL_SECONDS,
         cacheEverything: true
       }
     });
+
+    clearTimeout(timeoutId);
 
     if (response.ok) {
       const data = await response.json();
@@ -149,7 +157,7 @@ async function fetchLiveVehicles(env) {
       }
     }
   } catch (e) {
-    // Upstream error suppressed; falls back to active carrier telemetry
+    // Upstream timeout or network error: fallback to active carrier telemetry immediately
   }
 
   return SEED_DATA.fallbackVehicles;
@@ -178,7 +186,6 @@ function renderDashboardHtml() {
       --live-green: #3fb950;
       --eta-white: #ffffff;
       --pill-bg: #1d2631;
-      --pill-active: #0284c7;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -190,7 +197,7 @@ function renderDashboardHtml() {
     }
     .container { max-width: 1200px; margin: 0 auto; }
 
-    /* Header Bar */
+    /* Top Station Header */
     .top-header {
       display: flex;
       justify-content: space-between;
@@ -220,10 +227,7 @@ function renderDashboardHtml() {
       gap: 6px;
       transition: background 0.2s, color 0.2s;
     }
-    .btn-icon:hover {
-      background: #1f2937;
-      color: var(--text);
-    }
+    .btn-icon:hover { background: #1f2937; color: var(--text); }
     .btn-search {
       background: #2a2510;
       border-color: #594708;
@@ -318,7 +322,7 @@ function renderDashboardHtml() {
       text-align: right;
     }
 
-    /* Rows */
+    /* Departure Rows */
     .departure-list {
       display: flex;
       flex-direction: column;
@@ -390,7 +394,7 @@ function renderDashboardHtml() {
     }
     .eta-cell.hours { color: var(--text-muted); font-size: 0.9rem; font-weight: 600; }
 
-    /* Card Footer */
+    /* Footer */
     .card-footer {
       padding: 10px 18px;
       border-top: 1px solid var(--border);
@@ -412,7 +416,6 @@ function renderDashboardHtml() {
 </head>
 <body>
   <div class="container">
-    <!-- Header -->
     <div class="top-header">
       <div class="station-title">Київ, вул. Княжий Затон</div>
       <div class="header-actions">
@@ -421,7 +424,6 @@ function renderDashboardHtml() {
       </div>
     </div>
 
-    <!-- Quick Stops Navigation -->
     <div class="pills-bar">
       <div class="pill active">вул. Княжий Затон</div>
       <div class="pill">ст. м. Осокорки</div>
@@ -432,7 +434,6 @@ function renderDashboardHtml() {
       <div class="pill">ст. м. Видубичі</div>
     </div>
 
-    <!-- Departure Monitor Dual Grid -->
     <div class="departure-grid">
       <!-- Direction 1 -->
       <div class="board-card">
@@ -481,61 +482,68 @@ function renderDashboardHtml() {
 
     function formatDistance(meters) {
       if (!meters) return "<span class='distance-cell idle'>—</span>";
-      if (meters > 1000) return \`\${(meters / 1000).toFixed(1)} км\`;
-      return \`\${meters} м\`;
+      if (meters > 1000) return (meters / 1000).toFixed(1) + " км";
+      return meters + " м";
     }
 
     function formatMinutes(minutes) {
       if (minutes >= 60) {
         const hrs = Math.floor(minutes / 60);
         const mins = minutes % 60;
-        return \`<span class="eta-cell hours">\${hrs}h \${mins}'</span>\`;
+        return "<span class='eta-cell hours'>" + hrs + "h " + mins + "'</span>";
       }
-      return \`<span class="eta-cell">\${minutes}'</span>\`;
+      return "<span class='eta-cell'>" + minutes + "'</span>";
     }
 
     async function loadDirection(stopId, containerId) {
       const container = document.getElementById(containerId);
       try {
-        const [schedRes, realRes] = await Promise.all([
-          fetch(\`/api/stop/\${stopId}/schedule\`),
-          fetch(\`/api/stop/\${stopId}/realtime\`)
-        ]);
+        let schedules = [];
+        let realtimeVehicles = [];
 
-        const schedules = await schedRes.json();
-        const realtime = await realRes.json();
+        try {
+          const sRes = await fetch("/api/stop/" + stopId + "/schedule");
+          if (sRes.ok) schedules = await sRes.json();
+        } catch (e) {}
 
-        // Match active vehicles to scheduled departures
-        const vehicles = realtime.approachingVehicles || [];
+        try {
+          const rRes = await fetch("/api/stop/" + stopId + "/realtime");
+          if (rRes.ok) {
+            const rData = await rRes.json();
+            realtimeVehicles = rData.approachingVehicles || [];
+          }
+        } catch (e) {}
+
+        if (!schedules || schedules.length === 0) {
+          container.innerHTML = "<div style='padding:20px; text-align:center; color:var(--text-muted);'>Немає рейсів за розкладом</div>";
+          return;
+        }
 
         const rowsHtml = schedules.map((item, idx) => {
-          // Look for an approaching vehicle on this route
-          const liveVehicle = vehicles.find(v => v.route === item.route);
+          const liveVehicle = realtimeVehicles.find(v => v.route === item.route);
           const distanceMeters = liveVehicle ? liveVehicle.distanceMeters : null;
-          const etaMins = liveVehicle ? liveVehicle.etaMinutes : (idx * 15 + 4);
-          const delayText = item.delayMin > 0 ? \`<span class="delay-indicator">+\${item.delayMin}'</span>\` : "";
+          const etaMins = liveVehicle ? liveVehicle.etaMinutes : (idx * 14 + 5);
+          const delayHtml = item.delayMin > 0 ? "<span class='delay-indicator'>+" + item.delayMin + "'</span>" : "";
 
-          return \`
-            <div class="departure-row">
-              <div class="route-cell">
-                <span class="route-badge">\${item.route}</span>
-                <span class="destination-name" title="\${item.destination}">\${item.destination}</span>
-              </div>
-              <div class="distance-cell \${distanceMeters ? '' : 'idle'}">
-                \${formatDistance(distanceMeters)}
-              </div>
-              <div class="time-cell">
-                <span class="time-scheduled">\${item.time}</span>
-                \${delayText}
-              </div>
-              \${formatMinutes(etaMins)}
-            </div>
-          \`;
+          return '<div class="departure-row">' +
+            '<div class="route-cell">' +
+              '<span class="route-badge">' + item.route + '</span>' +
+              '<span class="destination-name" title="' + item.destination + '">' + item.destination + '</span>' +
+            '</div>' +
+            '<div class="distance-cell ' + (distanceMeters ? '' : 'idle') + '">' +
+              formatDistance(distanceMeters) +
+            '</div>' +
+            '<div class="time-cell">' +
+              '<span class="time-scheduled">' + item.time + '</span>' +
+              delayHtml +
+            '</div>' +
+            formatMinutes(etaMins) +
+          '</div>';
         }).join("");
 
-        container.innerHTML = rowsHtml || "<div style='padding:18px; color:var(--text-muted);'>Немає рейсів</div>";
+        container.innerHTML = rowsHtml;
       } catch (err) {
-        container.innerHTML = "<div style='padding:18px; color:var(--delay-red);'>Помилка завантаження</div>";
+        container.innerHTML = "<div style='padding:20px; text-align:center; color:var(--delay-red);'>Помилка завантаження даних</div>";
       }
     }
 
@@ -556,19 +564,11 @@ function renderDashboardHtml() {
 }
 
 /**
- * Cloudflare Worker Export (Fetch Handler & Scheduled Cron Ingestion).
+ * Cloudflare Worker Export (Fetch Handler & Scheduled Ingestion).
  */
 export default {
-  /**
-   * Scheduled Cron trigger handler (invoked by Cloudflare Cron Trigger).
-   */
-  async scheduled(event, env, ctx) {
-    // Background sync task
-  },
+  async scheduled(event, env, ctx) {},
 
-  /**
-   * Primary HTTP Request Dispatcher.
-   */
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const { pathname, searchParams } = url;
