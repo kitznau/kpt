@@ -1,11 +1,11 @@
 /**
- * Cloudflare Worker: Kyiv Transit Departure Monitor (Server-Side Rendered)
+ * Cloudflare Worker: Kyiv Transit Departure Monitor (Server-Side Rendered with Europe/Kyiv TZ)
  * 
  * Educational Architecture Overview:
- * 1. Edge Server-Side Rendering (SSR): Pre-renders the full departure board HTML on the Edge before sending it to the client.
- *    This eliminates blank screens and layout shifts entirely (0ms Time-to-First-Contentful-Paint).
- * 2. Deep-Link Support: Reads `?stop=<id>` on the Edge and marks the active station pill and timetables directly in HTML.
- * 3. Client Hydration: Lightweight browser JS handles instant interactive switching between stops via the History API.
+ * 1. Timezone Normalization: Anchors all timetable computations to the official 'Europe/Kyiv' timezone (UTC+2/UTC+3).
+ *    This avoids UTC drift on Cloudflare Edge instances regardless of global data center location.
+ * 2. Edge Server-Side Rendering (SSR): Generates ready-to-display HTML at the Edge, ensuring instant page display.
+ * 3. Deep-Link Support: Reads `?stop=<id>` on the Edge and highlights the corresponding station pill.
  * 4. Geodesic Proximity: Employs the Haversine formula to compute metric distances and dynamic arrival ETAs.
  */
 
@@ -15,17 +15,22 @@ const CONFIG = {
   // Real-time GPS vehicle telemetry endpoint
   LIVE_GPS_URL: "http://193.23.225.211:8002/api/v1/vehicle-positions",
   // Standard transit speed (km/h) for urban bus corridors
-  DEFAULT_TRANSIT_SPEED_KMH: 22.0
+  DEFAULT_TRANSIT_SPEED_KMH: 22.0,
+  // Official timezone
+  TIMEZONE: "Europe/Kyiv"
 };
 
 /**
- * Calculates great-circle distance between two GPS coordinates using the Haversine formula.
+ * Returns current timestamp adjusted specifically to Europe/Kyiv timezone.
  * 
- * @param {number} lat1 Origin latitude
- * @param {number} lon1 Origin longitude
- * @param {number} lat2 Destination latitude
- * @param {number} lon2 Destination longitude
- * @returns {number} Distance in meters
+ * @returns {Date} Date instance representing current wall-clock time in Kyiv
+ */
+function getKyivNow() {
+  return new Date(new Date().toLocaleString("en-US", { timeZone: CONFIG.TIMEZONE }));
+}
+
+/**
+ * Calculates great-circle distance between two GPS coordinates using the Haversine formula.
  */
 function calculateHaversineDistance(lat1, lon1, lat2, lon2) {
   const EARTH_RADIUS_METERS = 6371000;
@@ -284,15 +289,18 @@ const LIVE_FLEET = [
 ];
 
 /**
- * Computes departure timetables dynamically tied to current server time.
+ * Computes departure timetables dynamically tied to current Europe/Kyiv time.
  */
 function getHubDepartures(hubKey) {
   const hub = HUBS[hubKey] || HUBS["knyazhyi-zaton"];
-  const now = new Date();
+  const now = getKyivNow();
+
+  const kyivTimeString = String(now.getHours()).padStart(2, "0") + ":" + String(now.getMinutes()).padStart(2, "0");
 
   return {
     hubKey: hubKey in HUBS ? hubKey : "knyazhyi-zaton",
     title: hub.title,
+    kyivTime: kyivTimeString,
     directions: hub.directions.map(dir => {
       return {
         id: dir.id,
@@ -452,7 +460,17 @@ function renderFullPageHtml(stopKey = "knyazhyi-zaton") {
       'letter-spacing: -0.02em;' +
       'color: var(--text);' +
     '}' +
-    '.header-actions { display: flex; gap: 8px; }' +
+    '.header-actions { display: flex; gap: 8px; align-items: center; }' +
+    '.clock-badge {' +
+      'background: #1e293b;' +
+      'border: 1px solid var(--border);' +
+      'color: #38bdf8;' +
+      'border-radius: 8px;' +
+      'padding: 7px 12px;' +
+      'font-size: 0.95rem;' +
+      'font-weight: 700;' +
+      'letter-spacing: 0.05em;' +
+    '}' +
     '.btn-icon {' +
       'background: var(--card-bg);' +
       'border: 1px solid var(--border);' +
@@ -639,6 +657,7 @@ function renderFullPageHtml(stopKey = "knyazhyi-zaton") {
     '<div class="top-header">' +
       '<div class="station-title" id="stationTitle">' + hubData.title + '</div>' +
       '<div class="header-actions">' +
+        '<div class="clock-badge" id="clockBadge">' + hubData.kyivTime + ' (Київ)</div>' +
         '<button class="btn-icon btn-search" id="refreshBtn">⟳ Оновити GPS</button>' +
         '<button class="btn-icon btn-fav" id="favBtn" title="Додати в обране">★</button>' +
       '</div>' +
@@ -656,9 +675,17 @@ function renderFullPageHtml(stopKey = "knyazhyi-zaton") {
     'const departureGrid = document.getElementById("departureGrid");' +
     'const refreshBtn = document.getElementById("refreshBtn");' +
     'const favBtn = document.getElementById("favBtn");' +
+    'const clockBadge = document.getElementById("clockBadge");' +
     'let currentStop = "' + hubData.hubKey + '";' +
     'let currentHub = ' + JSON.stringify(hubData) + ';' +
     'const expanded = {};' +
+
+    'function updateClock() {' +
+      'const now = new Date();' +
+      'const timeStr = now.toLocaleTimeString("uk-UA", { timeZone: "Europe/Kyiv", hour: "2-digit", minute: "2-digit" });' +
+      'if (clockBadge) clockBadge.textContent = timeStr + " (Київ)";' +
+    '}' +
+    'setInterval(updateClock, 10000);' +
 
     'function formatDistance(m) {' +
       'if (!m) return "<span class=\\"distance-cell idle\\">—</span>";' +
@@ -683,6 +710,7 @@ function renderFullPageHtml(stopKey = "knyazhyi-zaton") {
     'function render(hub) {' +
       'currentHub = hub;' +
       'stationTitle.textContent = hub.title;' +
+      'if (clockBadge && hub.kyivTime) clockBadge.textContent = hub.kyivTime + " (Київ)";' +
       'document.querySelectorAll(".pill").forEach(p => {' +
         'p.classList.toggle("active", p.dataset.stop === hub.hubKey);' +
       '});' +
@@ -781,7 +809,7 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // 1. Root route: Server-Side Rendered (SSR) HTML
+    // 1. Root route: Server-Side Rendered (SSR) HTML with Europe/Kyiv time
     if (pathname === "/" || pathname === "/index.html") {
       const stopKey = searchParams.get("stop") || "knyazhyi-zaton";
       const html = renderFullPageHtml(stopKey);
