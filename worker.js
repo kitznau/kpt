@@ -1,14 +1,10 @@
+// worker.js
+
 /**
  * Cloudflare Worker: Kyiv GTFS Static & Real-time Transit Tracker
  * 
  * Educational Architecture Overview:
- * 1. Hybrid Ingestion Pipeline:
- *    - Scheduled Cron Triggers (scheduled handler) execute daily off-peak ingestion of GTFS Static tables.
- *    - Edge KV (TRANSPORT_KV) serves pre-indexed stops and timetables with sub-millisecond latency.
- * 2. Real-Time Telemetry & Distance (fetch handler):
- *    - Ingests active vehicle telemetry via Kyivpastrans vehiclePosition API (port 8002).
- *    - Employs the Haversine formula to calculate Euclidean-geodesic proximity to target transit stops.
- *    - Dynamically computes ETA in minutes based on real-time transit velocity vectors.
+ * 
  */
 
 // Production API endpoints and operational constants
@@ -42,9 +38,9 @@ function calculateHaversineDistance(lat1, lon1, lat2, lon2) {
   const a =
     Math.sin(dLat / 2) * Math.sin(dLat / 2) +
     Math.cos(toRadians(lat1)) *
-      Math.cos(toRadians(lat2)) *
-      Math.sin(dLon / 2) *
-      Math.sin(dLon / 2);
+    Math.cos(toRadians(lat2)) *
+    Math.sin(dLon / 2) *
+    Math.sin(dLon / 2);
 
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   return Math.round(EARTH_RADIUS_METERS * c);
