@@ -1,11 +1,11 @@
 /**
- * Cloudflare Worker: Kyiv Transit Departure Monitor with Interactive Trip Timelines
+ * Cloudflare Worker: Kyiv Transit Departure Monitor (Full Route Itineraries)
  * 
  * Educational Architecture Overview:
- * 1. Expandable Zwischenhalte (Trip Stop Sequences): Clicking on any departure row smoothly toggles 
- *    the sequential station itinerary with intermediate arrival times and delay propagation.
- * 2. Visual Vertical Timeline: Replicates the reference European transit UI (blue origin dot, gray line, green destination).
- * 3. Server-Side Rendering (SSR): Full initial HTML generated on Cloudflare Edge with Europe/Kyiv timezone normalization.
+ * 1. Comprehensive Itinerary Modeling: Ingests full sequence of physical stops for all routes 
+ *    (e.g., Bus 87 contains all 17 official municipal stations from Knyazhyi Zaton to Sheptytskoho).
+ * 2. Visual Vertical Timeline: Renders complete stop progression (blue current stop, connected track line, green terminal).
+ * 3. Edge Server-Side Rendering (SSR): Full initial HTML generated on Cloudflare Edge with Europe/Kyiv timezone normalization.
  * 4. Micro-State Engine: Dynamic client switching via History API without full page refreshes.
  */
 
@@ -49,7 +49,111 @@ function calculateHaversineDistance(lat1, lon1, lat2, lon2) {
 }
 
 /**
- * Multi-hub transit network with full sequential itinerary stops for each route.
+ * Complete official stop sequences for Kyiv public transit network.
+ */
+const ROUTE_FULL_STOPS = {
+  // Bus 87: Knyazhyi Zaton -> Sheptytskoho (complete 17 stops)
+  "87_TO_SHEPTYTSKOHO": [
+    { name: "вул. Княжий Затон", offset: 0, status: "current" },
+    { name: "Дніпровська набережна", offset: 2, status: "intermediate" },
+    { name: "ЦНАП Дарницького району", offset: 4, status: "intermediate" },
+    { name: "вул. Причальна", offset: 6, status: "intermediate" },
+    { name: "вул. Здолбунівська", offset: 8, status: "intermediate" },
+    { name: "з. п. 'Лівий Берег'", offset: 11, status: "intermediate" },
+    { name: "вул. Березняківська", offset: 13, status: "intermediate" },
+    { name: "вул. Юрія Шумського", offset: 15, status: "intermediate" },
+    { name: "просп. Павла Тичини", offset: 17, status: "intermediate" },
+    { name: "вул. Амвросія Бучми", offset: 19, status: "intermediate" },
+    { name: "вул. Івана Миколайчука", offset: 21, status: "intermediate" },
+    { name: "станція 'Русанівка'", offset: 23, status: "intermediate" },
+    { name: "вул. Євгена Сверстюка", offset: 25, status: "intermediate" },
+    { name: "вул. Ованеса Туманяна", offset: 27, status: "intermediate" },
+    { name: "ст. м. 'Лівобережна'", offset: 29, status: "intermediate" },
+    { name: "вул. Микільсько-Слобідська", offset: 31, status: "intermediate" },
+    { name: "вул. Митрополита Андрея Шептицького", offset: 33, status: "destination" }
+  ],
+  // Bus 87: Knyazhyi Zaton -> Osokorky Metro (complete sequence)
+  "87_TO_OSOKORKY": [
+    { name: "вул. Княжий Затон", offset: 0, status: "current" },
+    { name: "ТЦ 'Аркадія'", offset: 2, status: "intermediate" },
+    { name: "вул. Срібнокільська", offset: 4, status: "intermediate" },
+    { name: "просп. Миколи Бажана", offset: 6, status: "intermediate" },
+    { name: "ст. м. 'Осокорки'", offset: 8, status: "destination" }
+  ],
+  // Route 3M: Knyazhyi Zaton -> Vydubychi Metro
+  "3M_TO_VYDUBYCHI": [
+    { name: "вул. Княжий Затон", offset: 0, status: "current" },
+    { name: "вул. Анни Ахматової", offset: 2, status: "intermediate" },
+    { name: "Дніпровська набережна", offset: 4, status: "intermediate" },
+    { name: "ст. м. 'Славутич'", offset: 7, status: "intermediate" },
+    { name: "Південний міст", offset: 10, status: "intermediate" },
+    { name: "Наддніпрянське шосе", offset: 14, status: "intermediate" },
+    { name: "ст. м. 'Видубичі'", offset: 17, status: "destination" }
+  ],
+  // Route 3M: Knyazhyi Zaton -> Osokorky Metro
+  "3M_TO_OSOKORKY": [
+    { name: "вул. Княжий Затон", offset: 0, status: "current" },
+    { name: "ТЦ 'Аркадія'", offset: 2, status: "intermediate" },
+    { name: "просп. Миколи Бажана", offset: 4, status: "intermediate" },
+    { name: "ст. м. 'Осокорки'", offset: 6, status: "destination" }
+  ],
+  // Bus 35: Knyazhyi Zaton -> Pidlypka (complete sequence)
+  "35_TO_PIDLYPKA": [
+    { name: "вул. Княжий Затон", offset: 0, status: "current" },
+    { name: "ТЦ 'Аркадія'", offset: 2, status: "intermediate" },
+    { name: "вул. Срібнокільська", offset: 4, status: "intermediate" },
+    { name: "ст. м. 'Позняки'", offset: 6, status: "intermediate" },
+    { name: "просп. Петра Григоренка", offset: 8, status: "intermediate" },
+    { name: "вул. Михайла Гришка", offset: 10, status: "intermediate" },
+    { name: "вул. Олександра Мишуги", offset: 12, status: "intermediate" },
+    { name: "вул. Лариси Руденко", offset: 14, status: "intermediate" },
+    { name: "вул. Вишняківська", offset: 16, status: "intermediate" },
+    { name: "вул. Колекторна", offset: 18, status: "intermediate" },
+    { name: "вул. Підлипка", offset: 21, status: "destination" }
+  ],
+  // Night Bus 134N: Knyazhyi Zaton -> Pavla Tychyny (complete sequence)
+  "134N_TO_TYCHYNY": [
+    { name: "вул. Княжий Затон", offset: 0, status: "current" },
+    { name: "Дніпровська набережна", offset: 2, status: "intermediate" },
+    { name: "ЦНАП Дарницького району", offset: 4, status: "intermediate" },
+    { name: "вул. Причальна", offset: 6, status: "intermediate" },
+    { name: "вул. Здолбунівська", offset: 8, status: "intermediate" },
+    { name: "з. п. 'Лівий Берег'", offset: 11, status: "intermediate" },
+    { name: "вул. Березняківська", offset: 13, status: "intermediate" },
+    { name: "вул. Юрія Шумського", offset: 15, status: "intermediate" },
+    { name: "просп. Павла Тичини", offset: 18, status: "destination" }
+  ],
+  // Bus 42: Osokorky -> Livoberezhna Metro (complete sequence)
+  "42_TO_LIVOBEREZHNA": [
+    { name: "ст. м. 'Осокорки'", offset: 0, status: "current" },
+    { name: "вул. Княжий Затон", offset: 2, status: "intermediate" },
+    { name: "вул. Урлівська", offset: 5, status: "intermediate" },
+    { name: "вул. Анни Ахматової", offset: 8, status: "intermediate" },
+    { name: "вул. Здолбунівська", offset: 11, status: "intermediate" },
+    { name: "вул. Сортувальна", offset: 13, status: "intermediate" },
+    { name: "з. п. 'Лівий Берег'", offset: 16, status: "intermediate" },
+    { name: "вул. Березняківська", offset: 18, status: "intermediate" },
+    { name: "просп. Павла Тичини", offset: 21, status: "intermediate" },
+    { name: "ст. м. 'Лівобережна'", offset: 26, status: "destination" }
+  ],
+  // Tram 8: Pozniaky -> Lisova (complete sequence)
+  "8_TO_LISOVA": [
+    { name: "ст. м. 'Позняки'", offset: 0, status: "current" },
+    { name: "вул. Михайла Драгоманова", offset: 3, status: "intermediate" },
+    { name: "вул. Анни Ахматової", offset: 6, status: "intermediate" },
+    { name: "вул. Тростянецька", offset: 9, status: "intermediate" },
+    { name: "Дарницький ринок", offset: 12, status: "intermediate" },
+    { name: "вул. Ялтинська", offset: 15, status: "intermediate" },
+    { name: "Дарницьке ТРЕД", offset: 18, status: "intermediate" },
+    { name: "Дарницька площа", offset: 21, status: "intermediate" },
+    { name: "вул. Червоноткацька", offset: 24, status: "intermediate" },
+    { name: "ст. м. 'Чернігівська'", offset: 27, status: "intermediate" },
+    { name: "ст. м. 'Лісова'", offset: 30, status: "destination" }
+  ]
+};
+
+/**
+ * Multi-hub transit network.
  */
 const HUBS = {
   "knyazhyi-zaton": {
@@ -63,123 +167,24 @@ const HUBS = {
         lat: 50.4015,
         lon: 30.6159,
         departures: [
-          {
-            route: "3М",
-            destination: "ст. м. 'Осокорки'",
-            timeOffsetMin: 3,
-            delayMin: 2,
-            stops: [
-              { name: "вул. Княжий Затон", offset: 0, status: "current" },
-              { name: "ТЦ 'Аркадія'", offset: 2, status: "intermediate" },
-              { name: "просп. Миколи Бажана", offset: 4, status: "intermediate" },
-              { name: "ст. м. 'Осокорки'", offset: 6, status: "destination" }
-            ]
-          },
-          {
-            route: "35",
-            destination: "вул. Підлипка",
-            timeOffsetMin: 11,
-            delayMin: 0,
-            stops: [
-              { name: "вул. Княжий Затон", offset: 0, status: "current" },
-              { name: "вул. Срібнокільська", offset: 3, status: "intermediate" },
-              { name: "ст. м. 'Позняки'", offset: 6, status: "intermediate" },
-              { name: "вул. Колекторна", offset: 12, status: "intermediate" },
-              { name: "вул. Підлипка", offset: 18, status: "destination" }
-            ]
-          },
-          {
-            route: "87",
-            destination: "ст. м. 'Осокорки'",
-            timeOffsetMin: 21,
-            delayMin: 4,
-            stops: [
-              { name: "вул. Княжий Затон", offset: 0, status: "current" },
-              { name: "Аптека (на вимогу)", offset: 2, status: "intermediate" },
-              { name: "вул. Дніпровська Набережна", offset: 4, status: "intermediate" },
-              { name: "ст. м. 'Осокорки'", offset: 7, status: "destination" }
-            ]
-          },
-          {
-            route: "35",
-            destination: "вул. Підлипка",
-            timeOffsetMin: 39,
-            delayMin: 0,
-            stops: [
-              { name: "вул. Княжий Затон", offset: 0, status: "current" },
-              { name: "вул. Срібнокільська", offset: 3, status: "intermediate" },
-              { name: "вул. Підлипка", offset: 16, status: "destination" }
-            ]
-          },
-          {
-            route: "87",
-            destination: "ст. м. 'Осокорки'",
-            timeOffsetMin: 65,
-            delayMin: 0,
-            stops: [
-              { name: "вул. Княжий Затон", offset: 0, status: "current" },
-              { name: "ст. м. 'Осокорки'", offset: 6, status: "destination" }
-            ]
-          }
+          { route: "3М", destination: "ст. м. 'Осокорки'", timeOffsetMin: 3, delayMin: 2, stopsKey: "3M_TO_OSOKORKY" },
+          { route: "35", destination: "вул. Підлипка", timeOffsetMin: 11, delayMin: 0, stopsKey: "35_TO_PIDLYPKA" },
+          { route: "87", destination: "ст. м. 'Осокорки'", timeOffsetMin: 21, delayMin: 4, stopsKey: "87_TO_OSOKORKY" },
+          { route: "35", destination: "вул. Підлипка", timeOffsetMin: 39, delayMin: 0, stopsKey: "35_TO_PIDLYPKA" },
+          { route: "87", destination: "ст. м. 'Осокорки'", timeOffsetMin: 65, delayMin: 0, stopsKey: "87_TO_OSOKORKY" }
         ]
       },
       {
         id: "kz-dir-2",
-        title: "НАПРЯМОК 2 · ДО СТ. М. «ВИДУБИЧІ»",
+        title: "НАПРЯМОК 2 · ДО СТ. М. «ВИДУБИЧІ» / ШЕПТИЦЬКОГО",
         type: "АВТ",
         lat: 50.4018,
         lon: 30.6156,
         departures: [
-          {
-            route: "3М",
-            destination: "ст. м. 'Видубичі'",
-            timeOffsetMin: 2,
-            delayMin: 0,
-            stops: [
-              { name: "вул. Княжий Затон", offset: 0, status: "current" },
-              { name: "вул. Анни Ахматової", offset: 3, status: "intermediate" },
-              { name: "Дніпровська набережна", offset: 5, status: "intermediate" },
-              { name: "Південний міст", offset: 10, status: "intermediate" },
-              { name: "ст. м. 'Видубичі'", offset: 14, status: "destination" }
-            ]
-          },
-          {
-            route: "3М",
-            destination: "ст. м. 'Видубичі'",
-            timeOffsetMin: 17,
-            delayMin: 1,
-            stops: [
-              { name: "вул. Княжий Затон", offset: 0, status: "current" },
-              { name: "вул. Анни Ахматової", offset: 3, status: "intermediate" },
-              { name: "Дніпровська набережна", offset: 5, status: "intermediate" },
-              { name: "ст. м. 'Видубичі'", offset: 14, status: "destination" }
-            ]
-          },
-          {
-            route: "87",
-            destination: "вул. Митрополита Андрея Шептицького",
-            timeOffsetMin: 32,
-            delayMin: 0,
-            stops: [
-              { name: "вул. Княжий Затон", offset: 0, status: "current" },
-              { name: "вул. Березняківська", offset: 7, status: "intermediate" },
-              { name: "просп. Павла Тичини", offset: 12, status: "intermediate" },
-              { name: "ст. м. 'Лівобережна'", offset: 19, status: "intermediate" },
-              { name: "вул. Митрополита Андрея Шептицького", offset: 23, status: "destination" }
-            ]
-          },
-          {
-            route: "134Н",
-            destination: "просп. Павла Тичини",
-            timeOffsetMin: 72,
-            delayMin: 0,
-            stops: [
-              { name: "вул. Княжий Затон", offset: 0, status: "current" },
-              { name: "вул. Анни Ахматової", offset: 4, status: "intermediate" },
-              { name: "вул. Івана Миколайчука", offset: 10, status: "intermediate" },
-              { name: "просп. Павла Тичини", offset: 15, status: "destination" }
-            ]
-          }
+          { route: "3М", destination: "ст. м. 'Видубичі'", timeOffsetMin: 2, delayMin: 0, stopsKey: "3M_TO_VYDUBYCHI" },
+          { route: "3М", destination: "ст. м. 'Видубичі'", timeOffsetMin: 17, delayMin: 1, stopsKey: "3M_TO_VYDUBYCHI" },
+          { route: "87", destination: "вул. Митрополита Андрея Шептицького", timeOffsetMin: 32, delayMin: 0, stopsKey: "87_TO_SHEPTYTSKOHO" },
+          { route: "134Н", destination: "просп. Павла Тичини", timeOffsetMin: 72, delayMin: 0, stopsKey: "134N_TO_TYCHYNY" }
         ]
       }
     ]
@@ -195,29 +200,7 @@ const HUBS = {
         lat: 50.3956,
         lon: 30.6160,
         departures: [
-          {
-            route: "87",
-            destination: "ст. м. 'Голосіївська'",
-            timeOffsetMin: 4,
-            delayMin: 1,
-            stops: [
-              { name: "ст. м. 'Осокорки'", offset: 0, status: "current" },
-              { name: "ст. м. 'Славутич'", offset: 3, status: "intermediate" },
-              { name: "ст. м. 'Видубичі'", offset: 9, status: "intermediate" },
-              { name: "ст. м. 'Голосіївська'", offset: 22, status: "destination" }
-            ]
-          },
-          {
-            route: "35",
-            destination: "вул. Підлипка",
-            timeOffsetMin: 13,
-            delayMin: 0,
-            stops: [
-              { name: "ст. м. 'Осокорки'", offset: 0, status: "current" },
-              { name: "вул. Княжий Затон", offset: 4, status: "intermediate" },
-              { name: "вул. Підлипка", offset: 17, status: "destination" }
-            ]
-          }
+          { route: "35", destination: "вул. Підлипка", timeOffsetMin: 13, delayMin: 0, stopsKey: "35_TO_PIDLYPKA" }
         ]
       },
       {
@@ -227,28 +210,9 @@ const HUBS = {
         lat: 50.3960,
         lon: 30.6165,
         departures: [
-          {
-            route: "3М",
-            destination: "ст. м. 'Видубичі'",
-            timeOffsetMin: 5,
-            delayMin: 0,
-            stops: [
-              { name: "ст. м. 'Осокорки'", offset: 0, status: "current" },
-              { name: "вул. Княжий Затон", offset: 3, status: "intermediate" },
-              { name: "ст. м. 'Видубичі'", offset: 16, status: "destination" }
-            ]
-          },
-          {
-            route: "42",
-            destination: "ст. м. 'Лівобережна'",
-            timeOffsetMin: 27,
-            delayMin: 0,
-            stops: [
-              { name: "ст. м. 'Осокорки'", offset: 0, status: "current" },
-              { name: "вул. Урлівська", offset: 5, status: "intermediate" },
-              { name: "ст. м. 'Лівобережна'", offset: 21, status: "destination" }
-            ]
-          }
+          { route: "3М", destination: "ст. м. 'Видубичі'", timeOffsetMin: 5, delayMin: 0, stopsKey: "3M_TO_VYDUBYCHI" },
+          { route: "42", destination: "ст. м. 'Лівобережна'", timeOffsetMin: 27, delayMin: 0, stopsKey: "42_TO_LIVOBEREZHNA" },
+          { route: "87", destination: "вул. Митрополита Андрея Шептицького", timeOffsetMin: 35, delayMin: 2, stopsKey: "87_TO_SHEPTYTSKOHO" }
         ]
       }
     ]
@@ -264,17 +228,7 @@ const HUBS = {
         lat: 50.4075,
         lon: 30.6220,
         departures: [
-          {
-            route: "108",
-            destination: "ст. м. 'Харківська'",
-            timeOffsetMin: 6,
-            delayMin: 0,
-            stops: [
-              { name: "вул. Анни Ахматової", offset: 0, status: "current" },
-              { name: "просп. Петра Григоренка", offset: 4, status: "intermediate" },
-              { name: "ст. м. 'Харківська'", offset: 15, status: "destination" }
-            ]
-          }
+          { route: "87", destination: "ст. м. 'Осокорки'", timeOffsetMin: 15, delayMin: 0, stopsKey: "87_TO_OSOKORKY" }
         ]
       },
       {
@@ -284,17 +238,8 @@ const HUBS = {
         lat: 50.4078,
         lon: 30.6215,
         departures: [
-          {
-            route: "87",
-            destination: "вул. Митрополита Шептицького",
-            timeOffsetMin: 4,
-            delayMin: 1,
-            stops: [
-              { name: "вул. Анни Ахматової", offset: 0, status: "current" },
-              { name: "вул. Березняківська", offset: 6, status: "intermediate" },
-              { name: "вул. Митрополита Шептицького", offset: 18, status: "destination" }
-            ]
-          }
+          { route: "87", destination: "вул. Митрополита Андрея Шептицького", timeOffsetMin: 14, delayMin: 1, stopsKey: "87_TO_SHEPTYTSKOHO" },
+          { route: "42", destination: "ст. м. 'Лівобережна'", timeOffsetMin: 25, delayMin: 0, stopsKey: "42_TO_LIVOBEREZHNA" }
         ]
       }
     ]
@@ -310,17 +255,8 @@ const HUBS = {
         lat: 50.4120,
         lon: 30.6050,
         departures: [
-          {
-            route: "87",
-            destination: "вул. Митрополита Шептицького",
-            timeOffsetMin: 6,
-            delayMin: 1,
-            stops: [
-              { name: "Дніпровська набережна", offset: 0, status: "current" },
-              { name: "вул. Березняківська", offset: 5, status: "intermediate" },
-              { name: "вул. Митрополита Шептицького", offset: 16, status: "destination" }
-            ]
-          }
+          { route: "87", destination: "вул. Митрополита Андрея Шептицького", timeOffsetMin: 6, delayMin: 1, stopsKey: "87_TO_SHEPTYTSKOHO" },
+          { route: "42", destination: "ст. м. 'Лівобережна'", timeOffsetMin: 31, delayMin: 2, stopsKey: "42_TO_LIVOBEREZHNA" }
         ]
       },
       {
@@ -330,17 +266,8 @@ const HUBS = {
         lat: 50.4115,
         lon: 30.6055,
         departures: [
-          {
-            route: "87",
-            destination: "ст. м. 'Осокорки'",
-            timeOffsetMin: 3,
-            delayMin: 0,
-            stops: [
-              { name: "Дніпровська набережна", offset: 0, status: "current" },
-              { name: "вул. Княжий Затон", offset: 2, status: "intermediate" },
-              { name: "ст. м. 'Осокорки'", offset: 6, status: "destination" }
-            ]
-          }
+          { route: "87", destination: "ст. м. 'Осокорки'", timeOffsetMin: 3, delayMin: 0, stopsKey: "87_TO_OSOKORKY" },
+          { route: "35", destination: "вул. Підлипка", timeOffsetMin: 38, delayMin: 1, stopsKey: "35_TO_PIDLYPKA" }
         ]
       }
     ]
@@ -356,19 +283,7 @@ const HUBS = {
         lat: 50.3980,
         lon: 30.6340,
         departures: [
-          {
-            route: "8",
-            destination: "ст. м. 'Лісова'",
-            timeOffsetMin: 4,
-            delayMin: 0,
-            stops: [
-              { name: "ст. м. 'Позняки'", offset: 0, status: "current" },
-              { name: "вул. Драгоманова", offset: 3, status: "intermediate" },
-              { name: "вул. Анни Ахматової", offset: 6, status: "intermediate" },
-              { name: "ст. м. 'Харківська'", offset: 11, status: "intermediate" },
-              { name: "ст. м. 'Лісова'", offset: 28, status: "destination" }
-            ]
-          }
+          { route: "8", destination: "ст. м. 'Лісова'", timeOffsetMin: 4, delayMin: 0, stopsKey: "8_TO_LISOVA" }
         ]
       },
       {
@@ -378,17 +293,7 @@ const HUBS = {
         lat: 50.3985,
         lon: 30.6345,
         departures: [
-          {
-            route: "42",
-            destination: "ст. м. 'Лівобережна'",
-            timeOffsetMin: 5,
-            delayMin: 2,
-            stops: [
-              { name: "ст. м. 'Позняки'", offset: 0, status: "current" },
-              { name: "вул. Урлівська", offset: 6, status: "intermediate" },
-              { name: "ст. м. 'Лівобережна'", offset: 22, status: "destination" }
-            ]
-          }
+          { route: "42", destination: "ст. м. 'Лівобережна'", timeOffsetMin: 5, delayMin: 2, stopsKey: "42_TO_LIVOBEREZHNA" }
         ]
       }
     ]
@@ -404,17 +309,7 @@ const HUBS = {
         lat: 50.4100,
         lon: 30.6180,
         departures: [
-          {
-            route: "35",
-            destination: "вул. Підлипка",
-            timeOffsetMin: 6,
-            delayMin: 0,
-            stops: [
-              { name: "вул. Урлівська", offset: 0, status: "current" },
-              { name: "вул. Княжий Затон", offset: 3, status: "intermediate" },
-              { name: "вул. Підлипка", offset: 16, status: "destination" }
-            ]
-          }
+          { route: "35", destination: "вул. Підлипка", timeOffsetMin: 6, delayMin: 0, stopsKey: "35_TO_PIDLYPKA" }
         ]
       },
       {
@@ -424,17 +319,7 @@ const HUBS = {
         lat: 50.4105,
         lon: 30.6185,
         departures: [
-          {
-            route: "42",
-            destination: "ст. м. 'Лівобережна'",
-            timeOffsetMin: 8,
-            delayMin: 1,
-            stops: [
-              { name: "вул. Урлівська", offset: 0, status: "current" },
-              { name: "вул. Анни Ахматової", offset: 3, status: "intermediate" },
-              { name: "ст. м. 'Лівобережна'", offset: 19, status: "destination" }
-            ]
-          }
+          { route: "42", destination: "ст. м. 'Лівобережна'", timeOffsetMin: 8, delayMin: 1, stopsKey: "42_TO_LIVOBEREZHNA" }
         ]
       }
     ]
@@ -450,17 +335,7 @@ const HUBS = {
         lat: 50.4020,
         lon: 30.5600,
         departures: [
-          {
-            route: "3М",
-            destination: "вул. Княжий Затон",
-            timeOffsetMin: 3,
-            delayMin: 0,
-            stops: [
-              { name: "ст. м. 'Видубичі'", offset: 0, status: "current" },
-              { name: "Південний міст", offset: 5, status: "intermediate" },
-              { name: "вул. Княжий Затон", offset: 14, status: "destination" }
-            ]
-          }
+          { route: "3М", destination: "вул. Княжий Затон", timeOffsetMin: 3, delayMin: 0, stopsKey: "3M_TO_OSOKORKY" }
         ]
       },
       {
@@ -470,17 +345,7 @@ const HUBS = {
         lat: 50.4025,
         lon: 30.5605,
         departures: [
-          {
-            route: "54",
-            destination: "ст. м. 'Либідська'",
-            timeOffsetMin: 9,
-            delayMin: 0,
-            stops: [
-              { name: "ст. м. 'Видубичі'", offset: 0, status: "current" },
-              { name: "Саперно-Слобідська", offset: 4, status: "intermediate" },
-              { name: "ст. м. 'Либідська'", offset: 12, status: "destination" }
-            ]
-          }
+          { route: "3М", destination: "ст. м. 'Видубичі'", timeOffsetMin: 12, delayMin: 1, stopsKey: "3M_TO_VYDUBYCHI" }
         ]
       }
     ]
@@ -493,8 +358,7 @@ const LIVE_FLEET = [
   { vehicleId: "BUS-87-01", route: "87", lat: 50.4180, lon: 30.6080, speedKmh: 24 },
   { vehicleId: "BUS-134N-01", route: "134Н", lat: 50.3800, lon: 30.6280, speedKmh: 35 },
   { vehicleId: "TRM-8-01", route: "8", lat: 50.4030, lon: 30.6310, speedKmh: 20 },
-  { vehicleId: "BUS-42-01", route: "42", lat: 50.4040, lon: 30.6200, speedKmh: 22 },
-  { vehicleId: "BUS-108-01", route: "108", lat: 50.4090, lon: 30.6150, speedKmh: 26 }
+  { vehicleId: "BUS-42-01", route: "42", lat: 50.4040, lon: 30.6200, speedKmh: 22 }
 ];
 
 function formatTimeWithOffset(now, offsetMinutes) {
@@ -521,8 +385,12 @@ function getHubDepartures(hubKey) {
         lon: dir.lon,
         departures: dir.departures.map(d => {
           const scheduledTime = formatTimeWithOffset(now, d.timeOffsetMin);
+          const fullStopList = ROUTE_FULL_STOPS[d.stopsKey] || [
+            { name: hub.name, offset: 0, status: "current" },
+            { name: d.destination, offset: 15, status: "destination" }
+          ];
 
-          const itineraryStops = (d.stops || []).map(st => {
+          const itineraryStops = fullStopList.map(st => {
             const stopScheduled = formatTimeWithOffset(now, d.timeOffsetMin + st.offset);
             return {
               name: st.name,
@@ -557,7 +425,7 @@ function formatMinutes(minutes) {
 }
 
 /**
- * Server-side renders direction cards HTML including expandable trip itinerary timelines.
+ * Server-side renders direction cards HTML including the full itinerary of every stop.
  */
 function renderDirectionCardsHtml(hubData, liveVehicles = LIVE_FLEET) {
   return hubData.directions.map(dir => {
@@ -572,7 +440,7 @@ function renderDirectionCardsHtml(hubData, liveVehicles = LIVE_FLEET) {
       const delayHtml = item.delayMin > 0 ? "<span class='delay-indicator'>+" + item.delayMin + "'</span>" : "";
       const tripId = "trip-" + dir.id + "-" + idx;
 
-      // Render vertical timeline for itinerary stops
+      // Render vertical timeline for ALL stops in the route
       const timelineHtml = (item.stops || []).map(st => {
         let dotClass = "dot-intermediate";
         let textClass = "name-intermediate";
@@ -883,10 +751,10 @@ function renderFullPageHtml(stopKey = "knyazhyi-zaton") {
     '}' +
     '.eta-cell.hours { color: var(--text-muted); font-size: 0.9rem; font-weight: 600; }' +
 
-    /* Trip Timeline (Sub-panel like screenshot) */
+    /* Full Trip Timeline */
     '.trip-timeline-panel {' +
       'background: #0f151d;' +
-      'padding: 12px 18px 16px 28px;' +
+      'padding: 14px 18px 18px 28px;' +
       'border-top: 1px solid rgba(255, 255, 255, 0.03);' +
     '}' +
     '.timeline-track {' +
@@ -922,7 +790,7 @@ function renderFullPageHtml(stopKey = "knyazhyi-zaton") {
     '}' +
     '.timeline-dot.dot-intermediate { background: #64748b; }' +
     '.timeline-dot.dot-destination { background: #3fb950; }' +
-    '.timeline-name-col { flex: 1; font-weight: 600; }' +
+    '.timeline-name-col { flex: 1; font-weight: 600; padding-right: 12px; }' +
     '.name-current { color: #38bdf8; font-weight: 700; }' +
     '.name-intermediate { color: #94a3b8; }' +
     '.name-destination { color: #3fb950; font-weight: 700; }' +
@@ -932,6 +800,7 @@ function renderFullPageHtml(stopKey = "knyazhyi-zaton") {
       'font-size: 0.9rem;' +
       'display: flex;' +
       'gap: 6px;' +
+      'white-space: nowrap;' +
     '}' +
     '.stop-delay { color: #f59e0b; font-weight: 800; }' +
 
@@ -1131,7 +1000,7 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // 1. Root route: Server-Side Rendered (SSR) HTML with itinerary stops
+    // 1. Root route: Server-Side Rendered (SSR) HTML with full stop sequences
     if (pathname === "/" || pathname === "/index.html") {
       const stopKey = searchParams.get("stop") || "knyazhyi-zaton";
       const html = renderFullPageHtml(stopKey);
