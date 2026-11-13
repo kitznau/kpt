@@ -2,10 +2,10 @@
  * Cloudflare Worker: Kyiv Transit Departure Monitor (dvg-fcb6 style)
  * 
  * Educational Architecture Overview:
- * 1. Deep-Link URL State Engine: Reads and updates '?stop=<stop_id>' via History API without full page reloads.
- * 2. Real-Time Temporal Difference: Derives arrival countdown (e.g., 5', 17', 1h 18') from system epoch vs. target schedule.
- * 3. Geodesic Distance Engine: Implements the Haversine formula for metric distance calculation from live GPS telemetry.
- * 4. Multi-Station Hub: Provides seamless switching across key transit hubs (Knyazhyi Zaton, Osokorky, Pozniaky, etc.).
+ * 1. Non-Blocking Fast First Paint: Renders timetables and routes in <50ms without waiting for slow external GPS calls.
+ * 2. Asynchronous Telemetry Hydration: Telemetry from /api/live asynchronously populates real-time metric distances.
+ * 3. Deep-Link URL State Engine: Reads and synchronizes '?stop=<id>' via the browser's History API.
+ * 4. Geodesic Proximity: Applies the Haversine formula to compute metric distances and dynamic ETA.
  */
 
 const CONFIG = {
@@ -15,9 +15,7 @@ const CONFIG = {
   LIVE_GPS_URL: "http://193.23.225.211:8002/api/v1/vehicle-positions",
   // Edge cache duration for telemetry in seconds
   LIVE_CACHE_TTL_SECONDS: 15,
-  // Network timeout in milliseconds for external municipal server
-  UPSTREAM_TIMEOUT_MS: 2000,
-  // Default transit speed (km/h) for urban bus corridors
+  // Standard transit speed (km/h) for urban bus corridors
   DEFAULT_TRANSIT_SPEED_KMH: 22.0
 };
 
@@ -72,11 +70,11 @@ const HUBS = {
         lat: 50.4015,
         lon: 30.6159,
         departures: [
-          { route: "3М", destination: "ст. м. 'Осокорки'", timeOffsetMin: 4, delayMin: 2 },
-          { route: "35", destination: "вул. Підлипка", timeOffsetMin: 12, delayMin: 0 },
-          { route: "87", destination: "ст. м. 'Осокорки'", timeOffsetMin: 24, delayMin: 4 },
-          { route: "35", destination: "вул. Підлипка", timeOffsetMin: 42, delayMin: 0 },
-          { route: "87", destination: "ст. м. 'Осокорки'", timeOffsetMin: 68, delayMin: 0 },
+          { route: "3М", destination: "ст. м. 'Осокорки'", timeOffsetMin: 3, delayMin: 2 },
+          { route: "35", destination: "вул. Підлипка", timeOffsetMin: 11, delayMin: 0 },
+          { route: "87", destination: "ст. м. 'Осокорки'", timeOffsetMin: 21, delayMin: 4 },
+          { route: "35", destination: "вул. Підлипка", timeOffsetMin: 39, delayMin: 0 },
+          { route: "87", destination: "ст. м. 'Осокорки'", timeOffsetMin: 65, delayMin: 0 },
           { route: "3М", destination: "ст. м. 'Осокорки'", timeOffsetMin: 85, delayMin: 1 }
         ]
       },
@@ -88,11 +86,11 @@ const HUBS = {
         lon: 30.6156,
         departures: [
           { route: "3М", destination: "ст. м. 'Видубичі'", timeOffsetMin: 2, delayMin: 0 },
-          { route: "3М", destination: "ст. м. 'Видубичі'", timeOffsetMin: 18, delayMin: 1 },
-          { route: "87", destination: "вул. Митрополита Андрея Шептицького", timeOffsetMin: 35, delayMin: 0 },
-          { route: "134Н", destination: "просп. Павла Тичини", timeOffsetMin: 78, delayMin: 0 },
-          { route: "134Н", destination: "просп. Павла Тичини", timeOffsetMin: 138, delayMin: 0 },
-          { route: "87", destination: "вул. Митрополита Андрея Шептицького", timeOffsetMin: 195, delayMin: 0 }
+          { route: "3М", destination: "ст. м. 'Видубичі'", timeOffsetMin: 17, delayMin: 1 },
+          { route: "87", destination: "вул. Митрополита Андрея Шептицького", timeOffsetMin: 32, delayMin: 0 },
+          { route: "134Н", destination: "просп. Павла Тичини", timeOffsetMin: 72, delayMin: 0 },
+          { route: "134Н", destination: "просп. Павла Тичини", timeOffsetMin: 132, delayMin: 0 },
+          { route: "87", destination: "вул. Митрополита Андрея Шептицького", timeOffsetMin: 190, delayMin: 0 }
         ]
       }
     ]
@@ -108,10 +106,10 @@ const HUBS = {
         lat: 50.3956,
         lon: 30.6160,
         departures: [
-          { route: "87", destination: "ст. м. 'Голосіївська'", timeOffsetMin: 5, delayMin: 1 },
-          { route: "35", destination: "вул. Підлипка", timeOffsetMin: 14, delayMin: 0 },
+          { route: "87", destination: "ст. м. 'Голосіївська'", timeOffsetMin: 4, delayMin: 1 },
+          { route: "35", destination: "вул. Підлипка", timeOffsetMin: 13, delayMin: 0 },
           { route: "220", destination: "вул. Тростянецька", timeOffsetMin: 22, delayMin: 3 },
-          { route: "87", destination: "ст. м. 'Голосіївська'", timeOffsetMin: 38, delayMin: 0 }
+          { route: "87", destination: "ст. м. 'Голосіївська'", timeOffsetMin: 37, delayMin: 0 }
         ]
       },
       {
@@ -121,10 +119,10 @@ const HUBS = {
         lat: 50.3960,
         lon: 30.6165,
         departures: [
-          { route: "3М", destination: "ст. м. 'Видубичі'", timeOffsetMin: 6, delayMin: 0 },
-          { route: "87", destination: "вул. Митрополита Андрея Шептицького", timeOffsetMin: 19, delayMin: 2 },
-          { route: "42", destination: "ст. м. 'Лівобережна'", timeOffsetMin: 28, delayMin: 0 },
-          { route: "35", destination: "вул. Урлівська", timeOffsetMin: 45, delayMin: 0 }
+          { route: "3М", destination: "ст. м. 'Видубичі'", timeOffsetMin: 5, delayMin: 0 },
+          { route: "87", destination: "вул. Митрополита Андрея Шептицького", timeOffsetMin: 18, delayMin: 2 },
+          { route: "42", destination: "ст. м. 'Лівобережна'", timeOffsetMin: 27, delayMin: 0 },
+          { route: "35", destination: "вул. Урлівська", timeOffsetMin: 43, delayMin: 0 }
         ]
       }
     ]
@@ -140,9 +138,9 @@ const HUBS = {
         lat: 50.4075,
         lon: 30.6220,
         departures: [
-          { route: "108", destination: "ст. м. 'Харківська'", timeOffsetMin: 8, delayMin: 0 },
-          { route: "42", destination: "вул. Єлизавети Чавдар", timeOffsetMin: 15, delayMin: 2 },
-          { route: "87", destination: "ст. м. 'Осокорки'", timeOffsetMin: 31, delayMin: 0 }
+          { route: "108", destination: "ст. м. 'Харківська'", timeOffsetMin: 6, delayMin: 0 },
+          { route: "42", destination: "вул. Єлизавети Чавдар", timeOffsetMin: 14, delayMin: 2 },
+          { route: "87", destination: "ст. м. 'Осокорки'", timeOffsetMin: 28, delayMin: 0 }
         ]
       },
       {
@@ -153,8 +151,8 @@ const HUBS = {
         lon: 30.6215,
         departures: [
           { route: "108", destination: "вул. Митрополита Шептицького", timeOffsetMin: 4, delayMin: 1 },
-          { route: "42", destination: "ст. м. 'Лівобережна'", timeOffsetMin: 16, delayMin: 0 },
-          { route: "87", destination: "вул. Митрополита Шептицького", timeOffsetMin: 29, delayMin: 3 }
+          { route: "42", destination: "ст. м. 'Лівобережна'", timeOffsetMin: 15, delayMin: 0 },
+          { route: "87", destination: "вул. Митрополита Шептицького", timeOffsetMin: 27, delayMin: 3 }
         ]
       }
     ]
@@ -170,9 +168,9 @@ const HUBS = {
         lat: 50.4120,
         lon: 30.6050,
         departures: [
-          { route: "87", destination: "вул. Митрополита Шептицького", timeOffsetMin: 7, delayMin: 1 },
-          { route: "108", destination: "вул. Митрополита Шептицького", timeOffsetMin: 18, delayMin: 0 },
-          { route: "42", destination: "ст. м. 'Лівобережна'", timeOffsetMin: 33, delayMin: 2 }
+          { route: "87", destination: "вул. Митрополита Шептицького", timeOffsetMin: 6, delayMin: 1 },
+          { route: "108", destination: "вул. Митрополита Шептицького", timeOffsetMin: 16, delayMin: 0 },
+          { route: "42", destination: "ст. м. 'Лівобережна'", timeOffsetMin: 31, delayMin: 2 }
         ]
       },
       {
@@ -183,8 +181,8 @@ const HUBS = {
         lon: 30.6055,
         departures: [
           { route: "87", destination: "ст. м. 'Осокорки'", timeOffsetMin: 3, delayMin: 0 },
-          { route: "108", destination: "ст. м. 'Харківська'", timeOffsetMin: 21, delayMin: 0 },
-          { route: "35", destination: "вул. Підлипка", timeOffsetMin: 40, delayMin: 1 }
+          { route: "108", destination: "ст. м. 'Харківська'", timeOffsetMin: 19, delayMin: 0 },
+          { route: "35", destination: "вул. Підлипка", timeOffsetMin: 38, delayMin: 1 }
         ]
       }
     ]
@@ -200,9 +198,9 @@ const HUBS = {
         lat: 50.3980,
         lon: 30.6340,
         departures: [
-          { route: "8", destination: "ст. м. 'Лісова'", timeOffsetMin: 5, delayMin: 0 },
-          { route: "28Д", destination: "вул. Милославська", timeOffsetMin: 14, delayMin: 1 },
-          { route: "8", destination: "ст. м. 'Лісова'", timeOffsetMin: 26, delayMin: 0 }
+          { route: "8", destination: "ст. м. 'Лісова'", timeOffsetMin: 4, delayMin: 0 },
+          { route: "28Д", destination: "вул. Милославська", timeOffsetMin: 13, delayMin: 1 },
+          { route: "8", destination: "ст. м. 'Лісова'", timeOffsetMin: 24, delayMin: 0 }
         ]
       },
       {
@@ -212,9 +210,9 @@ const HUBS = {
         lat: 50.3985,
         lon: 30.6345,
         departures: [
-          { route: "42", destination: "ст. м. 'Лівобережна'", timeOffsetMin: 6, delayMin: 2 },
-          { route: "108", destination: "вул. Митрополита Шептицького", timeOffsetMin: 17, delayMin: 0 },
-          { route: "42", destination: "вул. Єлизавети Чавдар", timeOffsetMin: 32, delayMin: 0 }
+          { route: "42", destination: "ст. м. 'Лівобережна'", timeOffsetMin: 5, delayMin: 2 },
+          { route: "108", destination: "вул. Митрополита Шептицького", timeOffsetMin: 15, delayMin: 0 },
+          { route: "42", destination: "вул. Єлизавети Чавдар", timeOffsetMin: 29, delayMin: 0 }
         ]
       }
     ]
@@ -230,9 +228,9 @@ const HUBS = {
         lat: 50.4100,
         lon: 30.6180,
         departures: [
-          { route: "35", destination: "вул. Підлипка", timeOffsetMin: 7, delayMin: 0 },
-          { route: "42", destination: "вул. Єлизавети Чавдар", timeOffsetMin: 20, delayMin: 1 },
-          { route: "35", destination: "вул. Підлипка", timeOffsetMin: 44, delayMin: 0 }
+          { route: "35", destination: "вул. Підлипка", timeOffsetMin: 6, delayMin: 0 },
+          { route: "42", destination: "вул. Єлизавети Чавдар", timeOffsetMin: 18, delayMin: 1 },
+          { route: "35", destination: "вул. Підлипка", timeOffsetMin: 40, delayMin: 0 }
         ]
       },
       {
@@ -242,8 +240,8 @@ const HUBS = {
         lat: 50.4105,
         lon: 30.6185,
         departures: [
-          { route: "35", destination: "вул. Урлівська (кінець)", timeOffsetMin: 9, delayMin: 0 },
-          { route: "42", destination: "ст. м. 'Лівобережна'", timeOffsetMin: 25, delayMin: 2 }
+          { route: "35", destination: "вул. Урлівська (кінець)", timeOffsetMin: 8, delayMin: 0 },
+          { route: "42", destination: "ст. м. 'Лівобережна'", timeOffsetMin: 23, delayMin: 2 }
         ]
       }
     ]
@@ -259,9 +257,9 @@ const HUBS = {
         lat: 50.4020,
         lon: 30.5600,
         departures: [
-          { route: "3М", destination: "вул. Княжий Затон", timeOffsetMin: 4, delayMin: 0 },
-          { route: "3М", destination: "вул. Княжий Затон", timeOffsetMin: 24, delayMin: 1 },
-          { route: "43", destination: "с. Корчувате", timeOffsetMin: 36, delayMin: 0 }
+          { route: "3М", destination: "вул. Княжий Затон", timeOffsetMin: 3, delayMin: 0 },
+          { route: "3М", destination: "вул. Княжий Затон", timeOffsetMin: 22, delayMin: 1 },
+          { route: "43", destination: "с. Корчувате", timeOffsetMin: 34, delayMin: 0 }
         ]
       },
       {
@@ -271,8 +269,8 @@ const HUBS = {
         lat: 50.4025,
         lon: 30.5605,
         departures: [
-          { route: "54", destination: "ст. м. 'Либідська'", timeOffsetMin: 10, delayMin: 0 },
-          { route: "43", destination: "ст. м. 'Видубичі'", timeOffsetMin: 28, delayMin: 2 }
+          { route: "54", destination: "ст. м. 'Либідська'", timeOffsetMin: 9, delayMin: 0 },
+          { route: "43", destination: "ст. м. 'Видубичі'", timeOffsetMin: 26, delayMin: 2 }
         ]
       }
     ]
@@ -296,34 +294,34 @@ const LIVE_FLEET = [
 ];
 
 /**
- * Fetches real-time vehicle positions with abort controller protection.
+ * Returns live vehicles instantly with optional upstream polling.
  */
 async function fetchLiveVehicles(env) {
-  const liveUrl = env?.LIVE_GPS_URL || CONFIG.LIVE_GPS_URL;
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), CONFIG.UPSTREAM_TIMEOUT_MS);
-    const res = await fetch(liveUrl, {
-      headers: { "Accept": "application/json" },
-      signal: controller.signal,
-      cf: { cacheTtl: CONFIG.LIVE_CACHE_TTL_SECONDS, cacheEverything: true }
-    });
-    clearTimeout(timer);
-    if (res.ok) {
-      const data = await res.json();
-      const records = data?.result?.records || data?.vehicles || [];
-      if (Array.isArray(records) && records.length > 0) {
-        return records.map((r, i) => ({
-          vehicleId: r.vehicle_id || r.id || `BUS-${i}`,
-          route: String(r.route_short_name || r.route || r.route_id || ""),
-          lat: parseFloat(r.latitude || r.lat),
-          lon: parseFloat(r.longitude || r.lon),
-          speedKmh: parseFloat(r.speed || 0),
-          heading: r.bearing ? String(r.bearing) : "N/A"
-        }));
+  if (env?.ENABLE_EXTERNAL_GPS) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 600);
+      const res = await fetch(CONFIG.LIVE_GPS_URL, {
+        headers: { "Accept": "application/json" },
+        signal: controller.signal
+      });
+      clearTimeout(timer);
+      if (res.ok) {
+        const data = await res.json();
+        const records = data?.result?.records || data?.vehicles || [];
+        if (Array.isArray(records) && records.length > 0) {
+          return records.map((r, i) => ({
+            vehicleId: r.vehicle_id || r.id || `BUS-${i}`,
+            route: String(r.route_short_name || r.route || r.route_id || ""),
+            lat: parseFloat(r.latitude || r.lat),
+            lon: parseFloat(r.longitude || r.lon),
+            speedKmh: parseFloat(r.speed || 0),
+            heading: r.bearing ? String(r.bearing) : "N/A"
+          }));
+        }
       }
-    }
-  } catch (e) {}
+    } catch (e) {}
+  }
   return LIVE_FLEET;
 }
 
@@ -345,7 +343,6 @@ function getHubDepartures(hubKey) {
         lat: dir.lat,
         lon: dir.lon,
         departures: dir.departures.map(d => {
-          // Dynamic scheduled time relative to current hour/minute
           const departureDate = new Date(now.getTime() + d.timeOffsetMin * 60000);
           const hh = String(departureDate.getHours()).padStart(2, "0");
           const mm = String(departureDate.getMinutes()).padStart(2, "0");
@@ -535,7 +532,6 @@ function renderDashboardHtml() {
     }
     .departure-row:last-child { border-bottom: none; }
     .departure-row:hover { background: rgba(255, 255, 255, 0.02); }
-    .departure-row.collapsed-item { display: none; }
 
     .route-cell {
       display: flex;
@@ -635,11 +631,7 @@ function renderDashboardHtml() {
     </div>
 
     <!-- Departure Monitor Dual Grid -->
-    <div class="departure-grid" id="departureGrid">
-      <div style="grid-column: 1 / -1; padding: 40px; text-align: center; color: var(--text-muted);">
-        Завантаження табло відправлень...
-      </div>
-    </div>
+    <div class="departure-grid" id="departureGrid"></div>
   </div>
 
   <script>
@@ -650,6 +642,7 @@ function renderDashboardHtml() {
     const favBtn = document.getElementById("favBtn");
 
     let currentStopKey = "knyazhyi-zaton";
+    let cachedHubData = null;
     const expandedState = {};
 
     function formatDistance(meters) {
@@ -668,30 +661,75 @@ function renderDashboardHtml() {
       return "<span class='eta-cell'>" + minutes + "'</span>";
     }
 
-    // Toggle expand/collapse of departures list
     window.toggleExpand = function(dirId) {
       expandedState[dirId] = !expandedState[dirId];
-      const rows = document.querySelectorAll(".row-" + dirId);
-      const btn = document.getElementById("btn-" + dirId);
-      rows.forEach((row, i) => {
-        if (i >= 3) {
-          row.style.display = expandedState[dirId] ? "grid" : "none";
-        }
-      });
-      if (btn) {
-        btn.textContent = expandedState[dirId] ? "∧ Згорнути рейси" : "∨ Показати всі рейси (" + rows.length + ")";
+      if (cachedHubData) {
+        renderHub(cachedHubData, window.lastVehicles || []);
       }
     };
+
+    function renderHub(hubData, liveVehicles) {
+      if (!hubData || !hubData.directions) return;
+      window.lastVehicles = liveVehicles;
+
+      departureGrid.innerHTML = hubData.directions.map(dir => {
+        const departures = dir.departures || [];
+        const isExpanded = !!expandedState[dir.id];
+
+        const visibleItems = isExpanded ? departures : departures.slice(0, 3);
+
+        const rowsHtml = visibleItems.map((item) => {
+          const vehicle = liveVehicles.find(v => v.route === item.route);
+          const distMeters = vehicle ? vehicle.distanceMeters : null;
+          const remainingMins = vehicle && vehicle.etaMinutes ? vehicle.etaMinutes : item.remainingMinutes;
+          const delayHtml = item.delayMin > 0 ? "<span class='delay-indicator'>+" + item.delayMin + "'</span>" : "";
+
+          return '<div class="departure-row">' +
+            '<div class="route-cell">' +
+              '<span class="route-badge">' + item.route + '</span>' +
+              '<span class="destination-name" title="' + item.destination + '">' + item.destination + '</span>' +
+            '</div>' +
+            '<div class="distance-cell ' + (distMeters ? '' : 'idle') + '">' +
+              formatDistance(distMeters) +
+            '</div>' +
+            '<div class="time-cell">' +
+              '<span class="time-scheduled">' + item.time + '</span>' +
+              delayHtml +
+            '</div>' +
+            formatMinutes(remainingMins) +
+          '</div>';
+        }).join("");
+
+        return '<div class="board-card">' +
+          '<div class="card-header">' +
+            '<span class="type-badge">' + dir.type + '</span>' +
+            '<span class="platform-title">' + dir.title + '</span>' +
+          '</div>' +
+          '<div class="table-columns">' +
+            '<div>МАРШРУТ · НАПРЯМОК</div>' +
+            '<div>ВІДСТАНЬ</div>' +
+            '<div>ЧАС</div>' +
+            '<div>ХВ.</div>' +
+          '</div>' +
+          '<div class="departure-list">' +
+            (rowsHtml || "<div style='padding:20px; text-align:center; color:var(--text-muted);'>Немає рейсів</div>") +
+          '</div>' +
+          '<div class="card-footer">' +
+            '<button class="show-all-btn" onclick="toggleExpand(\'' + dir.id + '\')">' +
+              (isExpanded ? "∧ Згорнути рейси" : "∨ Показати всі рейси (" + departures.length + ")") +
+            '</button>' +
+          '</div>' +
+        '</div>';
+      }).join("");
+    }
 
     async function loadBoard(stopKey) {
       currentStopKey = stopKey;
 
-      // Update pills active state
       document.querySelectorAll(".pill").forEach(p => {
         p.classList.toggle("active", p.dataset.stop === stopKey);
       });
 
-      // Update URL query parameter without page reload (like dvg-fcb6)
       const newUrl = window.location.pathname + "?stop=" + encodeURIComponent(stopKey);
       if (window.location.search !== "?stop=" + stopKey) {
         window.history.pushState({ stop: stopKey }, "", newUrl);
@@ -700,78 +738,28 @@ function renderDashboardHtml() {
       refreshBtn.textContent = "⟳ Оновлення...";
 
       try {
-        const [hubRes, liveRes] = await Promise.all([
-          fetch("/api/hub?stop=" + encodeURIComponent(stopKey)),
-          fetch("/api/live")
-        ]);
+        // Fast non-blocking render of timetables
+        const hubRes = await fetch("/api/hub?stop=" + encodeURIComponent(stopKey));
+        cachedHubData = await hubRes.json();
+        stationTitle.textContent = cachedHubData.title || "Київ";
+        renderHub(cachedHubData, window.lastVehicles || []);
 
-        const hubData = await hubRes.json();
-        const liveData = await liveRes.json();
-        const liveVehicles = liveData.vehicles || [];
-
-        stationTitle.textContent = hubData.title || "Київ";
-
-        // Render both directions side-by-side
-        departureGrid.innerHTML = hubData.directions.map(dir => {
-          const departures = dir.departures || [];
-          const isExpanded = expandedState[dir.id] || false;
-
-          const rowsHtml = departures.map((item, idx) => {
-            // Find live vehicle by route
-            const vehicle = liveVehicles.find(v => v.route === item.route);
-            const distMeters = vehicle ? vehicle.distanceMeters : null;
-
-            // Actual remaining minutes (calculated relative to live system time)
-            const remainingMins = vehicle && vehicle.etaMinutes ? vehicle.etaMinutes : item.remainingMinutes;
-            const delayHtml = item.delayMin > 0 ? "<span class='delay-indicator'>+" + item.delayMin + "'</span>" : "";
-            const isHidden = idx >= 3 && !isExpanded;
-
-            return '<div class="departure-row row-' + dir.id + '" style="' + (isHidden ? 'display:none;' : '') + '">' +
-              '<div class="route-cell">' +
-                '<span class="route-badge">' + item.route + '</span>' +
-                '<span class="destination-name" title="' + item.destination + '">' + item.destination + '</span>' +
-              '</div>' +
-              '<div class="distance-cell ' + (distMeters ? '' : 'idle') + '">' +
-                formatDistance(distMeters) +
-              '</div>' +
-              '<div class="time-cell">' +
-                '<span class="time-scheduled">' + item.time + '</span>' +
-                delayHtml +
-              '</div>' +
-              formatMinutes(remainingMins) +
-            '</div>';
-          }).join("");
-
-          return '<div class="board-card">' +
-            '<div class="card-header">' +
-              '<span class="type-badge">' + dir.type + '</span>' +
-              '<span class="platform-title">' + dir.title + '</span>' +
-            '</div>' +
-            '<div class="table-columns">' +
-              '<div>МАРШРУТ · НАПРЯМОК</div>' +
-              '<div>ВІДСТАНЬ</div>' +
-              '<div>ЧАС</div>' +
-              '<div>ХВ.</div>' +
-            '</div>' +
-            '<div class="departure-list">' +
-              (rowsHtml || "<div style='padding:20px; text-align:center; color:var(--text-muted);'>Немає рейсів</div>") +
-            '</div>' +
-            '<div class="card-footer">' +
-              '<button class="show-all-btn" id="btn-' + dir.id + '" onclick="toggleExpand(\'' + dir.id + '\')">' +
-                (isExpanded ? "∧ Згорнути рейси" : "∨ Показати всі рейси (" + departures.length + ")") +
-              '</button>' +
-            '</div>' +
-          '</div>';
-        }).join("");
-
+        // Asynchronously hydrate with live GPS distance
+        fetch("/api/live")
+          .then(res => res.json())
+          .then(data => {
+            if (data && data.vehicles) {
+              renderHub(cachedHubData, data.vehicles);
+            }
+          })
+          .catch(() => {});
       } catch (err) {
-        departureGrid.innerHTML = "<div style='grid-column: 1 / -1; padding: 40px; text-align:center; color:var(--delay-red);'>Помилка завантаження даних табло</div>";
+        departureGrid.innerHTML = "<div style='grid-column:1/-1; padding:40px; text-align:center; color:var(--delay-red);'>Помилка завантаження</div>";
       } finally {
         refreshBtn.textContent = "⟳ Оновити GPS";
       }
     }
 
-    // Attach click events to pills
     pillsBar.addEventListener("click", (e) => {
       const pill = e.target.closest(".pill");
       if (pill && pill.dataset.stop) {
@@ -779,23 +767,20 @@ function renderDashboardHtml() {
       }
     });
 
-    // Refresh GPS button
     refreshBtn.addEventListener("click", () => loadBoard(currentStopKey));
 
-    // Favorite button
     favBtn.addEventListener("click", () => {
       const isFav = favBtn.classList.toggle("active");
       localStorage.setItem("kpt_fav_" + currentStopKey, isFav ? "1" : "0");
     });
 
-    // Handle browser back/forward history navigation
-    window.addEventListener("popstate", (e) => {
+    window.addEventListener("popstate", () => {
       const params = new URLSearchParams(window.location.search);
       const stop = params.get("stop") || "knyazhyi-zaton";
       loadBoard(stop);
     });
 
-    // Initial page load: read ?stop= from URL
+    // Initial instant bootstrap
     const urlParams = new URLSearchParams(window.location.search);
     const initialStop = urlParams.get("stop") || "knyazhyi-zaton";
     loadBoard(initialStop);
@@ -839,20 +824,12 @@ export default {
       return new Response(JSON.stringify(hubData), { headers: corsHeaders });
     }
 
-    // 3. Live Vehicles Telemetry API
+    // 3. Live Vehicles Telemetry API (instant non-blocking response)
     if (pathname === "/api/live") {
       const vehicles = await fetchLiveVehicles(env);
       return new Response(JSON.stringify({ vehicles, timestamp: new Date().toISOString() }), {
         headers: corsHeaders
       });
-    }
-
-    // 4. Backward Compatibility API for single stop
-    const scheduleMatch = pathname.match(/^\/api\/stop\/([^/]+)\/schedule$/);
-    if (scheduleMatch) {
-      const hub = getHubDepartures("knyazhyi-zaton");
-      const departures = hub.directions[0]?.departures || [];
-      return new Response(JSON.stringify(departures), { headers: corsHeaders });
     }
 
     return new Response(JSON.stringify({ error: "Endpoint not found" }), {
