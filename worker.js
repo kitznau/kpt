@@ -5,7 +5,7 @@
  * 1. Geodesic Calculations: Uses the Haversine formula to compute great-circle distance between GPS coordinates.
  * 2. Real-time Estimation (ETA): Derives transit arrival time dynamically from distance and velocity vectors.
  * 3. Edge Caching: Leverages Cloudflare Cache API to minimize external API roundtrips and avoid rate limits.
- * 4. Micro-routing: Dispatches requests using standard URL parsing without external router dependencies.
+ * 4. Dual-Direction Stop Support: Segregates stop registries by operational travel heading (e.g., Knyazhyi Zaton).
  */
 
 // Dataset endpoints from data.kyivcity.gov.ua
@@ -18,20 +18,20 @@ const DATASET_URLS = {
   liveGps: "https://data.kyivcity.gov.ua/dataset/dani-pro-mistseznakhodzhennia-miskoho-elektrychnoho-ta-pasazhyrskoho-avtomobilnoho-tra-dep-transport"
 };
 
-// Default average city speed (in km/h) for urban public transit in Kyiv considering traffic conditions
+// Default average city speed (in km/h) for urban public transit in Kyiv
 const DEFAULT_TRANSIT_SPEED_KMH = 22.0;
 
 /**
- * Calculates the great-circle distance between two geographic coordinates using the Haversine formula.
+ * Calculates great-circle distance between two GPS coordinates using the Haversine formula.
  * 
- * @param {number} lat1 Latitude of first point (decimal degrees)
- * @param {number} lon1 Longitude of first point (decimal degrees)
- * @param {number} lat2 Latitude of second point (decimal degrees)
- * @param {number} lon2 Longitude of second point (decimal degrees)
+ * @param {number} lat1 Latitude of point 1
+ * @param {number} lon1 Longitude of point 1
+ * @param {number} lat2 Latitude of point 2
+ * @param {number} lon2 Longitude of point 2
  * @returns {number} Distance in meters
  */
 function calculateHaversineDistance(lat1, lon1, lat2, lon2) {
-  const EARTH_RADIUS_METERS = 6371000; // Mean Earth radius in meters
+  const EARTH_RADIUS_METERS = 6371000;
   const toRadians = (degrees) => (degrees * Math.PI) / 180;
 
   const dLat = toRadians(lat2 - lat1);
@@ -52,11 +52,10 @@ function calculateHaversineDistance(lat1, lon1, lat2, lon2) {
  * Estimates arrival time based on distance and vehicle speed.
  * 
  * @param {number} distanceMeters Distance in meters
- * @param {number} speedKmh Current speed in km/h (falls back to DEFAULT_TRANSIT_SPEED_KMH if idle or 0)
+ * @param {number} speedKmh Current speed in km/h
  * @returns {number} Estimated time to arrival (ETA) in minutes
  */
 function calculateETA(distanceMeters, speedKmh) {
-  // Use realistic transit speed if vehicle is currently stopped at traffic lights or passenger boarding
   const operationalSpeed = speedKmh > 5 ? speedKmh : DEFAULT_TRANSIT_SPEED_KMH;
   const speedMetersPerSecond = (operationalSpeed * 1000) / 3600;
   const etaSeconds = distanceMeters / speedMetersPerSecond;
@@ -64,44 +63,69 @@ function calculateETA(distanceMeters, speedKmh) {
 }
 
 /**
- * Seed/Demo dataset for initial execution and structural demonstration.
- * In a production pipeline, this is synchronized with data.kyivcity.gov.ua CKAN/GTFS resources.
+ * Stops, schedule, and live vehicle dataset including dual-direction stops for вул. Княжий Затон.
  */
 const DEMO_DATA = {
   stops: [
-    { id: "s-101", name: "Контрактова площа (Kontraktova Square)", type: "tram,bus", lat: 50.4652, lon: 30.5165 },
-    { id: "s-102", name: "Поштова площа (Poshtova Square)", type: "bus", lat: 50.4594, lon: 30.5256 },
-    { id: "s-103", name: "Майдан Незалежності (Maidan Nezalezhnosti)", type: "troly,bus", lat: 50.4501, lon: 30.5234 },
-    { id: "s-104", name: "Вулиця Хрещатик (Khreshchatyk Street)", type: "bus", lat: 50.4472, lon: 30.5218 },
-    { id: "s-105", name: "Станція метро 'Арсенальна' (Arsenalna Metro)", type: "bus,troly", lat: 50.4443, lon: 30.5452 }
+    {
+      id: "s-kz-01",
+      name: "вул. Княжий Затон (до ст. м. 'Осокорки' / пр. Бажана)",
+      type: "bus",
+      direction: "Південний напрямок",
+      lat: 50.4015,
+      lon: 30.6159
+    },
+    {
+      id: "s-kz-02",
+      name: "вул. Княжий Затон (до вул. Ахматової / ст. м. 'Лівобережна')",
+      type: "bus",
+      direction: "Північний напрямок",
+      lat: 50.4018,
+      lon: 30.6156
+    },
+    { id: "s-101", name: "Контрактова площа (Kontraktova Square)", type: "tram,bus", direction: "Поділ", lat: 50.4652, lon: 30.5165 },
+    { id: "s-102", name: "Поштова площа (Poshtova Square)", type: "bus", direction: "Центр", lat: 50.4594, lon: 30.5256 },
+    { id: "s-103", name: "Майдан Незалежності (Maidan Nezalezhnosti)", type: "troly,bus", direction: "Центр", lat: 50.4501, lon: 30.5234 }
   ],
   schedules: {
+    // Direction 1: towards Osokorky metro / Bazhana
+    "s-kz-01": [
+      { route: "Автобус 87", destination: "ст. м. 'Осокорки'", intervalsMinutes: 12, timetable: ["07:10", "07:22", "07:34", "07:46", "07:58", "08:10"] },
+      { route: "Автобус 42", destination: "вул. Єлизавети Чавдар", intervalsMinutes: 15, timetable: ["07:15", "07:30", "07:45", "08:00", "08:15", "08:30"] },
+      { route: "Автобус 35", destination: "вул. Підлипка", intervalsMinutes: 20, timetable: ["07:05", "07:25", "07:45", "08:05", "08:25"] }
+    ],
+    // Direction 2: towards Akhmatovoyi / Livoberezhna
+    "s-kz-02": [
+      { route: "Автобус 87", destination: "вул. Микільсько-Слобідська (ст. м. 'Лівобережна')", intervalsMinutes: 12, timetable: ["07:12", "07:24", "07:36", "07:48", "08:00", "08:12"] },
+      { route: "Автобус 42", destination: "ст. м. 'Лівобережна'", intervalsMinutes: 15, timetable: ["07:18", "07:33", "07:48", "08:03", "08:18", "08:33"] },
+      { route: "Автобус 35", destination: "вул. Урлівська", intervalsMinutes: 20, timetable: ["07:10", "07:30", "07:50", "08:10", "08:30"] }
+    ],
     "s-101": [
-      { route: "Трамвай 14", destination: "Автогенний завод", intervalsMinutes: 12, timetable: ["07:15", "07:27", "07:39", "07:51", "08:03", "08:15", "08:27"] },
-      { route: "Автобус 114", destination: "Залізничний вокзал 'Центральний'", intervalsMinutes: 15, timetable: ["07:10", "07:25", "07:40", "07:55", "08:10", "08:25"] }
+      { route: "Трамвай 14", destination: "Автогенний завод", intervalsMinutes: 12, timetable: ["07:15", "07:27", "07:39", "07:51"] }
     ],
     "s-102": [
-      { route: "Автобус 114", destination: "вул. Радунська", intervalsMinutes: 15, timetable: ["07:18", "07:33", "07:48", "08:03", "08:18", "08:33"] },
-      { route: "Автобус 62", destination: "Ботанічний сад", intervalsMinutes: 20, timetable: ["07:20", "07:40", "08:00", "08:20", "08:40"] }
+      { route: "Автобус 114", destination: "вул. Радунська", intervalsMinutes: 15, timetable: ["07:18", "07:33", "07:48", "08:03"] }
     ],
     "s-103": [
-      { route: "Тролейбус 16", destination: "вул. Щусєва", intervalsMinutes: 10, timetable: ["07:05", "07:15", "07:25", "07:35", "07:45", "07:55"] },
-      { route: "Тролейбус 18", destination: "вул. Сошенка", intervalsMinutes: 10, timetable: ["07:08", "07:18", "07:28", "07:38", "07:48", "07:58"] },
-      { route: "Автобус 24", destination: "Музей історії України у ІІ Світовій війні", intervalsMinutes: 14, timetable: ["07:12", "07:26", "07:40", "07:54", "08:08"] }
+      { route: "Тролейбус 16", destination: "вул. Щусєва", intervalsMinutes: 10, timetable: ["07:05", "07:15", "07:25", "07:35"] }
     ]
   },
-  // Active vehicles on route with live GPS telemetry
+  // Active vehicles on route with GPS coordinates and designated stop targeting
   liveVehicles: [
-    { vehicleId: "BUS-114-01", route: "Автобус 114", lat: 50.4610, lon: 50.5220, speedKmh: 24, heading: "SW" },
-    { vehicleId: "BUS-114-02", route: "Автобус 114", lat: 50.4705, lon: 30.5090, speedKmh: 18, heading: "SE" },
-    { vehicleId: "TRAM-14-01", route: "Трамвай 14", lat: 50.4680, lon: 30.5110, speedKmh: 20, heading: "S" },
-    { vehicleId: "TRL-16-01", route: "Тролейбус 16", lat: 50.4530, lon: 30.5180, speedKmh: 28, heading: "NE" },
-    { vehicleId: "BUS-24-01", route: "Автобус 24", lat: 50.4460, lon: 30.5290, speedKmh: 15, heading: "NW" }
+    // Approaching s-kz-01 (towards Osokorky)
+    { vehicleId: "BUS-87-01", route: "Автобус 87", targetStopId: "s-kz-01", lat: 50.4070, lon: 30.6130, speedKmh: 26, heading: "S" },
+    { vehicleId: "BUS-42-01", route: "Автобус 42", targetStopId: "s-kz-01", lat: 50.4120, lon: 30.6100, speedKmh: 20, heading: "S" },
+    { vehicleId: "BUS-35-01", route: "Автобус 35", targetStopId: "s-kz-01", lat: 50.4045, lon: 30.6145, speedKmh: 18, heading: "S" },
+
+    // Approaching s-kz-02 (towards Livoberezhna / Akhmatovoyi)
+    { vehicleId: "BUS-87-02", route: "Автобус 87", targetStopId: "s-kz-02", lat: 50.3950, lon: 30.6180, speedKmh: 23, heading: "N" },
+    { vehicleId: "BUS-42-02", route: "Автобус 42", targetStopId: "s-kz-02", lat: 50.3990, lon: 30.6170, speedKmh: 15, heading: "N" },
+    { vehicleId: "BUS-35-02", route: "Автобус 35", targetStopId: "s-kz-02", lat: 50.3910, lon: 30.6200, speedKmh: 28, heading: "N" }
   ]
 };
 
 /**
- * Generates an interactive, lightweight dashboard for testing and user interaction.
+ * Generates an interactive, lightweight dashboard for testing and real-time visualization.
  */
 function renderDashboardHtml() {
   return `<!DOCTYPE html>
@@ -158,6 +182,7 @@ function renderDashboardHtml() {
       font-size: 1rem;
       outline: none;
     }
+    select { flex: 1; min-width: 280px; }
     button {
       background: var(--tag-bg);
       cursor: pointer;
@@ -213,14 +238,14 @@ function renderDashboardHtml() {
   <div class="container">
     <header>
       <h1>🚎 Київський транспортний трекер</h1>
-      <p>Cloudflare Worker: розклад руху, поточна дистанція транспорту та прогнозований час прибуття (ETA).</p>
+      <p>Cloudflare Worker: розклад руху, дистанція транспорту та ETA для зупинок у 2-х напрямках.</p>
     </header>
 
     <div class="control-panel">
       <select id="stopSelect" aria-label="Оберіть зупинку">
         <option value="">Завантаження зупинок...</option>
       </select>
-      <button id="refreshBtn">Оновити реальний час</button>
+      <button id="refreshBtn">Оновити дані</button>
     </div>
 
     <div class="grid">
@@ -246,7 +271,7 @@ function renderDashboardHtml() {
         const res = await fetch("/api/stops");
         const stops = await res.json();
         stopSelect.innerHTML = stops.map(s => 
-          \`<option value="\${s.id}">\${s.name} (\${s.type})</option>\`
+          \`<option value="\${s.id}">\${s.name}</option>\`
         ).join("");
         if (stops.length > 0) {
           updateData(stops[0].id);
@@ -259,7 +284,6 @@ function renderDashboardHtml() {
     async function updateData(stopId) {
       if (!stopId) return;
 
-      // Fetch static timetable
       scheduleList.innerHTML = "Оновлення розкладу...";
       try {
         const sRes = await fetch(\`/api/stop/\${stopId}/schedule\`);
@@ -274,7 +298,7 @@ function renderDashboardHtml() {
                 <span class="badge">кожні \${item.intervalsMinutes} хв</span>
               </div>
               <p>Напрямок: \${item.destination}</p>
-              <p style="font-size: 0.85rem; margin-top: 4px;">Найближчі відправлення: \${item.timetable.slice(0, 4).join(", ")}</p>
+              <p style="font-size: 0.85rem; margin-top: 4px;">Найближчі рейси: \${item.timetable.slice(0, 4).join(", ")}</p>
             </div>
           \`).join("");
         }
@@ -282,13 +306,12 @@ function renderDashboardHtml() {
         scheduleList.innerHTML = "<p>Помилка отримання розкладу</p>";
       }
 
-      // Fetch real-time tracking, distance, and ETA
       realtimeList.innerHTML = "Пошук транспорту на лінії...";
       try {
         const rRes = await fetch(\`/api/stop/\${stopId}/realtime\`);
         const rData = await rRes.json();
         if (rData.approachingVehicles.length === 0) {
-          realtimeList.innerHTML = "<p>Поблизу немає активних одиниць транспорту для цієї зупинки.</p>";
+          realtimeList.innerHTML = "<p>Поблизу немає активних одиниць транспорту для цього напрямку.</p>";
         } else {
           realtimeList.innerHTML = rData.approachingVehicles.map(v => \`
             <div class="item">
@@ -296,8 +319,8 @@ function renderDashboardHtml() {
                 <span>\${v.route} <small style="color:var(--text-muted)">(\${v.vehicleId})</small></span>
                 <span class="eta-tag">⏳ ~ \${v.etaMinutes} хв</span>
               </div>
-              <p>Відстань до зупинки: <span class="distance-tag">\${v.distanceMeters > 1000 ? (v.distanceMeters/1000).toFixed(1) + ' км' : v.distanceMeters + ' м'}</span></p>
-              <p style="font-size: 0.85rem;">Поточна швидкість: \${v.speedKmh} км/год</p>
+              <p>Відстань: <span class="distance-tag">\${v.distanceMeters > 1000 ? (v.distanceMeters/1000).toFixed(1) + ' км' : v.distanceMeters + ' м'}</span></p>
+              <p style="font-size: 0.85rem;">Поточна швидкість: \${v.speedKmh} км/год (напрямок: \${v.heading})</p>
             </div>
           \`).join("");
         }
@@ -309,7 +332,6 @@ function renderDashboardHtml() {
     stopSelect.addEventListener("change", (e) => updateData(e.target.value));
     refreshBtn.addEventListener("click", () => updateData(stopSelect.value));
 
-    // Initialize application
     loadStops();
   </script>
 </body>
@@ -320,14 +342,6 @@ function renderDashboardHtml() {
  * Primary Cloudflare Worker entry point conforming to standard ES Modules format.
  */
 export default {
-  /**
-   * Request handler dispatches incoming HTTP requests to corresponding API endpoints.
-   * 
-   * @param {Request} request Standard Fetch Request object
-   * @param {object} env Environment bindings (KV, Secrets, etc.)
-   * @param {object} ctx Execution context (waitUntil, passThroughOnException)
-   * @returns {Promise<Response>}
-   */
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const { pathname, searchParams } = url;
@@ -339,7 +353,6 @@ export default {
       "Content-Type": "application/json; charset=utf-8"
     };
 
-    // Handle preflight CORS requests
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: corsHeaders });
     }
@@ -384,13 +397,12 @@ export default {
         );
       }
 
-      // Collect routes that serve this stop
       const stopSchedule = DEMO_DATA.schedules[stopId] || [];
       const validRouteNames = new Set(stopSchedule.map(s => s.route));
 
-      // Calculate distance and ETA for each active vehicle approaching this stop
+      // Filter vehicles matching current stop or servicing current routes
       const approachingVehicles = DEMO_DATA.liveVehicles
-        .filter(v => validRouteNames.size === 0 || validRouteNames.has(v.route))
+        .filter(v => (!v.targetStopId || v.targetStopId === stopId) && (validRouteNames.size === 0 || validRouteNames.has(v.route)))
         .map(v => {
           const distanceMeters = calculateHaversineDistance(v.lat, v.lon, stop.lat, stop.lon);
           const etaMinutes = calculateETA(distanceMeters, v.speedKmh);
@@ -406,11 +418,10 @@ export default {
             etaMinutes
           };
         })
-        // Sort ascending by arrival time (closest vehicle first)
         .sort((a, b) => a.distanceMeters - b.distanceMeters);
 
       const responsePayload = {
-        stop: { id: stop.id, name: stop.name, lat: stop.lat, lon: stop.lon },
+        stop: { id: stop.id, name: stop.name, direction: stop.direction, lat: stop.lat, lon: stop.lon },
         timestamp: new Date().toISOString(),
         approachingVehicles
       };
@@ -418,7 +429,6 @@ export default {
       return new Response(JSON.stringify(responsePayload), { headers: corsHeaders });
     }
 
-    // Fallback for unmapped routes
     return new Response(JSON.stringify({ error: "Route not found" }), {
       status: 404,
       headers: corsHeaders
