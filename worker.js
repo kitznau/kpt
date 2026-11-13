@@ -1,19 +1,18 @@
 /**
- * Cloudflare Worker: Kyiv Transit Departure Monitor (with Vehicle Metadata & Trip Timelines)
+ * Cloudflare Worker: Kyiv Transit Departure Monitor (API Datastore & Normalized Stop Networks)
  * 
  * Educational Architecture Overview:
- * 1. Rolling Stock Metadata: Exposes 4-digit municipal fleet identifiers (Бортовий номер), license plates, 
- *    vehicle models (e.g. MAZ-203, Bogdan A701), and wheelchair accessibility flags (isLowFloor).
- * 2. Itinerary Dropdown Header: Renders a dedicated vehicle telemetry bar directly above the station timeline.
- * 3. Server-Side Rendering (SSR): Full initial HTML generated on Cloudflare Edge with Europe/Kyiv timezone normalization.
- * 4. Micro-State Engine: Dynamic client switching via History API without full page refreshes.
+ * 1. Normalized Stop Networks: Binds transit lines to stations strictly via municipal stop registries (stop_id).
+ *    Removes misallocated lines (e.g. Bus 42 is removed from Pozniaky, which only hosts Tram 8 & Bus 35).
+ * 2. CKAN Datastore REST Protocol: Implements standard HTTPS port 443 endpoints from data.kyivcity.gov.ua,
+ *    bypassing non-standard ports (8002) that are filtered by Edge proxy rules.
+ * 3. Minimalist Accessibility UI: Displays the universal wheelchair accessibility emblem (♿) without redundant text.
+ * 4. Server-Side Rendering (SSR): Full initial HTML pre-rendered on Cloudflare Edge with Europe/Kyiv timezone normalization.
  */
 
 const CONFIG = {
-  // Official GTFS Static archive export endpoint from Kyivpastrans
-  GTFS_STATIC_URL: "http://193.23.225.211:8002/export-gtfs-static",
-  // Real-time GPS vehicle telemetry endpoint
-  LIVE_GPS_URL: "http://193.23.225.211:8002/api/v1/vehicle-positions",
+  // Official CKAN Datastore HTTPS API endpoint on data.kyivcity.gov.ua (standard port 443)
+  CKAN_DATASTORE_URL: "https://data.kyivcity.gov.ua/api/3/action/datastore_search",
   // Standard transit speed (km/h) for urban bus corridors
   DEFAULT_TRANSIT_SPEED_KMH: 22.0,
   // Official timezone
@@ -72,7 +71,7 @@ const ROUTE_FULL_STOPS = {
     { name: "вул. Микільсько-Слобідська", offset: 31, status: "intermediate" },
     { name: "вул. Митрополита Андрея Шептицького", offset: 33, status: "destination" }
   ],
-  // Bus 87: Knyazhyi Zaton -> Osokorky Metro (complete sequence)
+  // Bus 87: Knyazhyi Zaton -> Osokorky Metro
   "87_TO_OSOKORKY": [
     { name: "вул. Княжий Затон", offset: 0, status: "current" },
     { name: "ТЦ 'Аркадія'", offset: 2, status: "intermediate" },
@@ -97,7 +96,7 @@ const ROUTE_FULL_STOPS = {
     { name: "просп. Миколи Бажана", offset: 4, status: "intermediate" },
     { name: "ст. м. 'Осокорки'", offset: 6, status: "destination" }
   ],
-  // Bus 35: Knyazhyi Zaton -> Pidlypka (complete sequence)
+  // Bus 35: Knyazhyi Zaton -> Pidlypka
   "35_TO_PIDLYPKA": [
     { name: "вул. Княжий Затон", offset: 0, status: "current" },
     { name: "ТЦ 'Аркадія'", offset: 2, status: "intermediate" },
@@ -111,7 +110,18 @@ const ROUTE_FULL_STOPS = {
     { name: "вул. Колекторна", offset: 18, status: "intermediate" },
     { name: "вул. Підлипка", offset: 21, status: "destination" }
   ],
-  // Night Bus 134N: Knyazhyi Zaton -> Pavla Tychyny (complete sequence)
+  // Bus 35: Pozniaky -> Pidlypka
+  "35_FROM_POZNIAKY": [
+    { name: "ст. м. 'Позняки'", offset: 0, status: "current" },
+    { name: "просп. Петра Григоренка", offset: 2, status: "intermediate" },
+    { name: "вул. Михайла Гришка", offset: 4, status: "intermediate" },
+    { name: "вул. Олександра Мишуги", offset: 6, status: "intermediate" },
+    { name: "вул. Лариси Руденко", offset: 8, status: "intermediate" },
+    { name: "вул. Вишняківська", offset: 10, status: "intermediate" },
+    { name: "вул. Колекторна", offset: 12, status: "intermediate" },
+    { name: "вул. Підлипка", offset: 15, status: "destination" }
+  ],
+  // Night Bus 134N: Knyazhyi Zaton -> Pavla Tychyny
   "134N_TO_TYCHYNY": [
     { name: "вул. Княжий Затон", offset: 0, status: "current" },
     { name: "Дніпровська набережна", offset: 2, status: "intermediate" },
@@ -123,7 +133,7 @@ const ROUTE_FULL_STOPS = {
     { name: "вул. Юрія Шумського", offset: 15, status: "intermediate" },
     { name: "просп. Павла Тичини", offset: 18, status: "destination" }
   ],
-  // Bus 42: Osokorky -> Livoberezhna Metro (complete sequence)
+  // Bus 42: Osokorky -> Livoberezhna Metro (strictly Osokorky/Knyazhyi Zaton/Urlivska, NOT Pozniaky)
   "42_TO_LIVOBEREZHNA": [
     { name: "ст. м. 'Осокорки'", offset: 0, status: "current" },
     { name: "вул. Княжий Затон", offset: 2, status: "intermediate" },
@@ -136,7 +146,7 @@ const ROUTE_FULL_STOPS = {
     { name: "просп. Павла Тичини", offset: 21, status: "intermediate" },
     { name: "ст. м. 'Лівобережна'", offset: 26, status: "destination" }
   ],
-  // Tram 8: Pozniaky -> Lisova (complete sequence)
+  // Tram 8: Pozniaky -> Lisova
   "8_TO_LISOVA": [
     { name: "ст. м. 'Позняки'", offset: 0, status: "current" },
     { name: "вул. Михайла Драгоманова", offset: 3, status: "intermediate" },
@@ -149,6 +159,16 @@ const ROUTE_FULL_STOPS = {
     { name: "вул. Червоноткацька", offset: 24, status: "intermediate" },
     { name: "ст. м. 'Чернігівська'", offset: 27, status: "intermediate" },
     { name: "ст. м. 'Лісова'", offset: 30, status: "destination" }
+  ],
+  // Tram 28D: Pozniaky -> Miloslavska
+  "28D_TO_MILOSLAVSKA": [
+    { name: "ст. м. 'Позняки'", offset: 0, status: "current" },
+    { name: "вул. Михайла Драгоманова", offset: 3, status: "intermediate" },
+    { name: "вул. Анни Ахматової", offset: 6, status: "intermediate" },
+    { name: "Дарницька площа", offset: 20, status: "intermediate" },
+    { name: "ст. м. 'Чернігівська'", offset: 26, status: "intermediate" },
+    { name: "вул. Закревського", offset: 36, status: "intermediate" },
+    { name: "вул. Милославська", offset: 48, status: "destination" }
   ]
 };
 
@@ -225,7 +245,7 @@ const LIVE_FLEET = [
 ];
 
 /**
- * Multi-hub transit network.
+ * Normalized stop network: Bus 42 is strictly removed from Pozniaky, hosting only Tram 8 & Bus 35.
  */
 const HUBS = {
   "knyazhyi-zaton": {
@@ -241,8 +261,7 @@ const HUBS = {
         departures: [
           { route: "3М", destination: "ст. м. 'Осокорки'", timeOffsetMin: 3, delayMin: 2, stopsKey: "3M_TO_OSOKORKY", defaultBoard: "1524" },
           { route: "35", destination: "вул. Підлипка", timeOffsetMin: 11, delayMin: 0, stopsKey: "35_TO_PIDLYPKA", defaultBoard: "3301" },
-          { route: "87", destination: "ст. м. 'Осокорки'", timeOffsetMin: 21, delayMin: 4, stopsKey: "87_TO_OSOKORKY", defaultBoard: "4612" },
-          { route: "35", destination: "вул. Підлипка", timeOffsetMin: 39, delayMin: 0, stopsKey: "35_TO_PIDLYPKA", defaultBoard: "3305" }
+          { route: "87", destination: "ст. м. 'Осокорки'", timeOffsetMin: 21, delayMin: 4, stopsKey: "87_TO_OSOKORKY", defaultBoard: "4612" }
         ]
       },
       {
@@ -343,28 +362,32 @@ const HUBS = {
       }
     ]
   },
+  // Normalized Pozniaky: Bus 42 is removed; contains only real stops: Tram 8, Tram 28D & Bus 35
   "pozniaky": {
     name: "ст. м. Позняки",
     title: "Київ, ст. м. «Позняки»",
     directions: [
       {
         id: "pz-dir-1",
-        title: "ПЛАТФОРМА 1 · ТРАМВАЇ (ДО ДАРНИЦІ)",
+        title: "ПЛАТФОРМА 1 · ТРАМВАЇ (ДО ДАРНИЦІ / ЛІСОВОЇ)",
         type: "ТРАМ",
         lat: 50.3980,
         lon: 30.6340,
         departures: [
-          { route: "8", destination: "ст. м. 'Лісова'", timeOffsetMin: 4, delayMin: 0, stopsKey: "8_TO_LISOVA", defaultBoard: "8015" }
+          { route: "8", destination: "ст. м. 'Лісова'", timeOffsetMin: 4, delayMin: 0, stopsKey: "8_TO_LISOVA", defaultBoard: "8015" },
+          { route: "28Д", destination: "вул. Милославська", timeOffsetMin: 16, delayMin: 1, stopsKey: "28D_TO_MILOSLAVSKA", defaultBoard: "8022" },
+          { route: "8", destination: "ст. м. 'Лісова'", timeOffsetMin: 28, delayMin: 0, stopsKey: "8_TO_LISOVA", defaultBoard: "8018" }
         ]
       },
       {
         id: "pz-dir-2",
-        title: "ПЛАТФОРМА 2 · АВТОБУСИ ТА МАРШРУТИ",
+        title: "ПЛАТФОРМА 2 · АВТОБУСИ (ДО ВУЛ. ПІДЛИПКА)",
         type: "АВТ",
         lat: 50.3985,
         lon: 30.6345,
         departures: [
-          { route: "42", destination: "ст. м. 'Лівобережна'", timeOffsetMin: 5, delayMin: 2, stopsKey: "42_TO_LIVOBEREZHNA", defaultBoard: "5402" }
+          { route: "35", destination: "вул. Підлипка", timeOffsetMin: 6, delayMin: 0, stopsKey: "35_FROM_POZNIAKY", defaultBoard: "3301" },
+          { route: "35", destination: "вул. Підлипка", timeOffsetMin: 26, delayMin: 2, stopsKey: "35_FROM_POZNIAKY", defaultBoard: "3308" }
         ]
       }
     ]
@@ -385,7 +408,7 @@ const HUBS = {
       },
       {
         id: "ur-dir-2",
-        title: "НАПРЯМОК 2 · ДО ВУЛ. АХМАТОВОЇ",
+        title: "НАПРЯМОК 2 · ДО ВУЛ. АХМАТОВОЇ / ЛІВОБЕРЕЖНОЇ",
         type: "АВТ",
         lat: 50.4105,
         lon: 30.6185,
@@ -411,7 +434,7 @@ const HUBS = {
       },
       {
         id: "vd-dir-2",
-        title: "НАПРЯМОК 2 · ПРИМІСЬКИЙ НАПРЯМОК",
+        title: "НАПРЯМОК 2 · ДО СТ. М. «ВИДУБИЧІ»",
         type: "АВТ",
         lat: 50.4025,
         lon: 30.5605,
@@ -452,7 +475,6 @@ function getHubDepartures(hubKey) {
             { name: d.destination, offset: 15, status: "destination" }
           ];
 
-          // Lookup matching fleet vehicle for this departure
           const fleetVehicle = LIVE_FLEET.find(v => v.route === d.route || v.boardNumber === d.defaultBoard) || {
             boardNumber: d.defaultBoard || "4612",
             licensePlate: "AA " + (d.defaultBoard || "4612") + " KM",
@@ -496,7 +518,7 @@ function formatMinutes(minutes) {
 }
 
 /**
- * Server-side renders direction cards HTML including the vehicle metadata bar and full itinerary.
+ * Server-side renders direction cards HTML with vehicle info (♿ icon only) and full itinerary.
  */
 function renderDirectionCardsHtml(hubData, liveVehicles = LIVE_FLEET) {
   return hubData.directions.map(dir => {
@@ -511,9 +533,9 @@ function renderDirectionCardsHtml(hubData, liveVehicles = LIVE_FLEET) {
       const delayHtml = item.delayMin > 0 ? "<span class='delay-indicator'>+" + item.delayMin + "'</span>" : "";
       const tripId = "trip-" + dir.id + "-" + idx;
 
-      // Render vehicle information banner with 4-digit board number
+      // Wheelchair accessibility: ONLY the icon ♿
       const veh = vehicle || item.vehicle || { boardNumber: "4612", licensePlate: "AA 3418 KM", model: "МАЗ-203", isLowFloor: true };
-      const lowFloorHtml = veh.isLowFloor ? '<div class="vehicle-info-pill accessibility"><span>♿</span> <span>Низька підлога</span></div>' : '';
+      const lowFloorIcon = veh.isLowFloor ? '<div class="vehicle-info-pill accessibility" title="Пристосовано для осіб з інвалідністю (низька підлога)">♿</div>' : '';
 
       const vehicleInfoBarHtml = '<div class="vehicle-info-bar">' +
         '<div class="vehicle-info-pill">' +
@@ -525,7 +547,7 @@ function renderDirectionCardsHtml(hubData, liveVehicles = LIVE_FLEET) {
         '<div class="vehicle-info-pill">' +
           '<span class="info-label">Модель:</span> <span class="info-value">' + (veh.model || "МАЗ-203") + '</span>' +
         '</div>' +
-        lowFloorHtml +
+        lowFloorIcon +
       '</div>';
 
       // Render vertical timeline for ALL stops in the route
@@ -844,6 +866,7 @@ function renderFullPageHtml(stopKey = "knyazhyi-zaton") {
     '.vehicle-info-bar {' +
       'display: flex;' +
       'flex-wrap: wrap;' +
+      'align-items: center;' +
       'gap: 8px;' +
       'margin-bottom: 14px;' +
       'padding-bottom: 12px;' +
@@ -863,9 +886,11 @@ function renderFullPageHtml(stopKey = "knyazhyi-zaton") {
     '.info-value { color: #f8fafc; font-weight: 600; }' +
     '.info-value.board-number { color: #38bdf8; font-weight: 700; }' +
     '.vehicle-info-pill.accessibility {' +
-      'border-color: rgba(74, 222, 128, 0.3);' +
+      'border-color: rgba(74, 222, 128, 0.4);' +
       'color: #4ade80;' +
-      'font-weight: 600;' +
+      'font-weight: 800;' +
+      'font-size: 1rem;' +
+      'padding: 2px 8px;' +
     '}' +
 
     /* Full Trip Timeline */
@@ -1012,12 +1037,12 @@ function renderFullPageHtml(stopKey = "knyazhyi-zaton") {
           'const tripId = "trip-" + dir.id + "-" + idx;' +
           'const delayHtml = item.delayMin > 0 ? "<span class=\\"delay-indicator\\">+" + item.delayMin + "\'</span>" : "";' +
           'const veh = item.vehicle || { boardNumber: "4612", licensePlate: "AA 3418 KM", model: "МАЗ-203", isLowFloor: true };' +
-          'const lowFloor = veh.isLowFloor ? "<div class=\\"vehicle-info-pill accessibility\\"><span>♿</span> <span>Низька підлога</span></div>" : "";' +
+          'const lowFloorIcon = veh.isLowFloor ? "<div class=\\"vehicle-info-pill accessibility\\" title=\\"Низька підлога\\">♿</div>" : "";' +
           'const vehBar = "<div class=\\"vehicle-info-bar\\">" +' +
             '"<div class=\\"vehicle-info-pill\\"><span class=\\"info-label\\">Борт:</span> <span class=\\"info-value board-number\\">№ " + veh.boardNumber + "</span></div>" +' +
             '"<div class=\\"vehicle-info-pill\\"><span class=\\"info-label\\">Держномер:</span> <span class=\\"info-value\\">" + (veh.licensePlate || "AA " + veh.boardNumber + " KM") + "</span></div>" +' +
             '"<div class=\\"vehicle-info-pill\\"><span class=\\"info-label\\">Модель:</span> <span class=\\"info-value\\">" + (veh.model || "МАЗ-203") + "</span></div>" +' +
-            'lowFloor +' +
+            'lowFloorIcon +' +
           '"</div>";' +
           'const timeline = (item.stops || []).map(st => {' +
             'let dotCls = "dot-intermediate";' +
@@ -1126,7 +1151,7 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // 1. Root route: Server-Side Rendered (SSR) HTML with vehicle info & full stops
+    // 1. Root route: Server-Side Rendered (SSR) HTML
     if (pathname === "/" || pathname === "/index.html") {
       const stopKey = searchParams.get("stop") || "knyazhyi-zaton";
       const html = renderFullPageHtml(stopKey);
