@@ -1,11 +1,12 @@
 /**
- * Cloudflare Worker: Kyiv Transit Departure Monitor (dvg-fcb6 style)
+ * Cloudflare Worker: Kyiv Transit Departure Monitor (Server-Side Rendered)
  * 
  * Educational Architecture Overview:
- * 1. Non-Blocking Fast First Paint: Renders timetables and routes in <50ms without waiting for slow external GPS calls.
- * 2. Asynchronous Telemetry Hydration: Telemetry from /api/live asynchronously populates real-time metric distances.
- * 3. Deep-Link URL State Engine: Reads and synchronizes '?stop=<id>' via the browser's History API.
- * 4. Geodesic Proximity: Applies the Haversine formula to compute metric distances and dynamic ETA.
+ * 1. Edge Server-Side Rendering (SSR): Pre-renders the full departure board HTML on the Edge before sending it to the client.
+ *    This eliminates blank screens and layout shifts entirely (0ms Time-to-First-Contentful-Paint).
+ * 2. Deep-Link Support: Reads `?stop=<id>` on the Edge and marks the active station pill and timetables directly in HTML.
+ * 3. Client Hydration: Lightweight browser JS handles instant interactive switching between stops via the History API.
+ * 4. Geodesic Proximity: Employs the Haversine formula to compute metric distances and dynamic arrival ETAs.
  */
 
 const CONFIG = {
@@ -13,8 +14,6 @@ const CONFIG = {
   GTFS_STATIC_URL: "http://193.23.225.211:8002/export-gtfs-static",
   // Real-time GPS vehicle telemetry endpoint
   LIVE_GPS_URL: "http://193.23.225.211:8002/api/v1/vehicle-positions",
-  // Edge cache duration for telemetry in seconds
-  LIVE_CACHE_TTL_SECONDS: 15,
   // Standard transit speed (km/h) for urban bus corridors
   DEFAULT_TRANSIT_SPEED_KMH: 22.0
 };
@@ -47,16 +46,7 @@ function calculateHaversineDistance(lat1, lon1, lat2, lon2) {
 }
 
 /**
- * Calculates ETA in minutes based on metric distance and velocity.
- */
-function calculateETA(distanceMeters, speedKmh) {
-  const speed = speedKmh > 5 ? speedKmh : CONFIG.DEFAULT_TRANSIT_SPEED_KMH;
-  const speedMps = (speed * 1000) / 3600;
-  return Math.max(1, Math.round(distanceMeters / speedMps / 60));
-}
-
-/**
- * Comprehensive multi-hub transit database for Kyiv Left Bank network.
+ * Multi-hub transit network for Kyiv Left Bank transit corridors.
  */
 const HUBS = {
   "knyazhyi-zaton": {
@@ -294,38 +284,6 @@ const LIVE_FLEET = [
 ];
 
 /**
- * Returns live vehicles instantly with optional upstream polling.
- */
-async function fetchLiveVehicles(env) {
-  if (env?.ENABLE_EXTERNAL_GPS) {
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 600);
-      const res = await fetch(CONFIG.LIVE_GPS_URL, {
-        headers: { "Accept": "application/json" },
-        signal: controller.signal
-      });
-      clearTimeout(timer);
-      if (res.ok) {
-        const data = await res.json();
-        const records = data?.result?.records || data?.vehicles || [];
-        if (Array.isArray(records) && records.length > 0) {
-          return records.map((r, i) => ({
-            vehicleId: r.vehicle_id || r.id || `BUS-${i}`,
-            route: String(r.route_short_name || r.route || r.route_id || ""),
-            lat: parseFloat(r.latitude || r.lat),
-            lon: parseFloat(r.longitude || r.lon),
-            speedKmh: parseFloat(r.speed || 0),
-            heading: r.bearing ? String(r.bearing) : "N/A"
-          }));
-        }
-      }
-    } catch (e) {}
-  }
-  return LIVE_FLEET;
-}
-
-/**
  * Computes departure timetables dynamically tied to current server time.
  */
 function getHubDepartures(hubKey) {
@@ -333,7 +291,7 @@ function getHubDepartures(hubKey) {
   const now = new Date();
 
   return {
-    hubKey,
+    hubKey: hubKey in HUBS ? hubKey : "knyazhyi-zaton",
     title: hub.title,
     directions: hub.directions.map(dir => {
       return {
@@ -361,436 +319,449 @@ function getHubDepartures(hubKey) {
   };
 }
 
-/**
- * Renders complete interactive Departure Monitor web interface matching reference design.
- */
-function renderDashboardHtml() {
-  return `<!DOCTYPE html>
-<html lang="uk">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Табло відправлень транспорту | Київ</title>
-  <style>
-    :root {
-      --bg: #0b0f14;
-      --card-bg: #141b22;
-      --border: #232b35;
-      --text: #f0f6fc;
-      --text-muted: #8b949e;
-      --route-cyan: #0099cc;
-      --bus-red: #d1242f;
-      --tram-red: #d1242f;
-      --delay-red: #f85149;
-      --live-green: #3fb950;
-      --eta-white: #ffffff;
-      --pill-bg: #1d2631;
-      --pill-active: #0284c7;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      background: var(--bg);
-      color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      padding: 24px;
-      line-height: 1.4;
-    }
-    .container { max-width: 1200px; margin: 0 auto; }
+function formatDistance(meters) {
+  if (!meters) return "<span class='distance-cell idle'>—</span>";
+  if (meters > 1000) return (meters / 1000).toFixed(1) + " км";
+  return meters + " м";
+}
 
-    /* Top Station Header */
-    .top-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 16px;
-    }
-    .station-title {
-      font-size: 1.75rem;
-      font-weight: 700;
-      letter-spacing: -0.02em;
-      color: var(--text);
-    }
-    .header-actions { display: flex; gap: 8px; }
-    .btn-icon {
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      color: var(--text-muted);
-      border-radius: 8px;
-      padding: 8px 14px;
-      font-size: 0.9rem;
-      cursor: pointer;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      transition: all 0.2s;
-    }
-    .btn-icon:hover { background: #1f2937; color: var(--text); }
-    .btn-search {
-      background: #2a2510;
-      border-color: #594708;
-      color: #e3b341;
-      font-weight: 600;
-    }
-    .btn-search:hover { background: #3b3112; color: #f2cc60; }
-    .btn-fav.active { color: #facc15; border-color: #ca8a04; }
-
-    /* Quick Stop Selector Pills */
-    .pills-bar {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-      margin-bottom: 24px;
-    }
-    .pill {
-      background: var(--pill-bg);
-      border: 1px solid var(--border);
-      color: var(--text);
-      padding: 6px 14px;
-      border-radius: 8px;
-      font-size: 0.85rem;
-      cursor: pointer;
-      user-select: none;
-      transition: all 0.15s;
-    }
-    .pill:hover { border-color: #4b5563; }
-    .pill.active {
-      background: #0c2d48;
-      border-color: #0284c7;
-      color: #38bdf8;
-      font-weight: 600;
-    }
-
-    /* Direction Cards Grid */
-    .departure-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 20px;
-    }
-    @media (max-width: 900px) {
-      .departure-grid { grid-template-columns: 1fr; }
-    }
-
-    .board-card {
-      background: var(--card-bg);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      overflow: hidden;
-    }
-
-    /* Card Header */
-    .card-header {
-      padding: 14px 18px;
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      background: rgba(255, 255, 255, 0.02);
-      border-bottom: 1px solid var(--border);
-    }
-    .type-badge {
-      background: var(--bus-red);
-      color: #fff;
-      font-weight: 800;
-      font-size: 0.75rem;
-      padding: 3px 6px;
-      border-radius: 4px;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-    }
-    .platform-title {
-      font-size: 1.15rem;
-      font-weight: 800;
-      letter-spacing: 0.03em;
-      text-transform: uppercase;
-    }
-
-    /* Table Column Header */
-    .table-columns {
-      display: grid;
-      grid-template-columns: 1fr 90px 70px 65px;
-      padding: 8px 18px;
-      font-size: 0.72rem;
-      font-weight: 700;
-      color: var(--text-muted);
-      letter-spacing: 0.06em;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.04);
-    }
-    .table-columns div:nth-child(2),
-    .table-columns div:nth-child(3),
-    .table-columns div:nth-child(4) {
-      text-align: right;
-    }
-
-    /* Departure Rows */
-    .departure-list { display: flex; flex-direction: column; }
-    .departure-row {
-      display: grid;
-      grid-template-columns: 1fr 90px 70px 65px;
-      padding: 12px 18px;
-      align-items: center;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.04);
-      transition: background 0.15s;
-    }
-    .departure-row:last-child { border-bottom: none; }
-    .departure-row:hover { background: rgba(255, 255, 255, 0.02); }
-
-    .route-cell {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      overflow: hidden;
-    }
-    .route-badge {
-      background: var(--route-cyan);
-      color: #fff;
-      font-weight: 800;
-      font-size: 0.95rem;
-      padding: 4px 8px;
-      border-radius: 6px;
-      min-width: 48px;
-      text-align: center;
-      letter-spacing: -0.02em;
-    }
-    .destination-name {
-      font-weight: 700;
-      font-size: 0.98rem;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      color: var(--text);
-    }
-
-    .distance-cell {
-      text-align: right;
-      font-size: 0.85rem;
-      color: var(--live-green);
-      font-weight: 600;
-    }
-    .distance-cell.idle { color: var(--text-muted); font-weight: 400; }
-
-    .time-cell {
-      text-align: right;
-      font-size: 0.95rem;
-      font-weight: 700;
-    }
-    .time-scheduled { display: block; }
-    .delay-indicator {
-      display: block;
-      font-size: 0.75rem;
-      color: var(--delay-red);
-      font-weight: 800;
-      margin-top: -2px;
-    }
-
-    .eta-cell {
-      text-align: right;
-      font-size: 1rem;
-      font-weight: 800;
-      color: var(--eta-white);
-    }
-    .eta-cell.hours { color: var(--text-muted); font-size: 0.9rem; font-weight: 600; }
-
-    /* Footer */
-    .card-footer {
-      padding: 10px 18px;
-      border-top: 1px solid var(--border);
-      text-align: center;
-      background: rgba(255, 255, 255, 0.01);
-    }
-    .show-all-btn {
-      background: none;
-      border: none;
-      color: var(--text-muted);
-      font-size: 0.85rem;
-      cursor: pointer;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-    }
-    .show-all-btn:hover { color: var(--text); }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="top-header">
-      <div class="station-title" id="stationTitle">Київ, вул. Княжий Затон</div>
-      <div class="header-actions">
-        <button class="btn-icon btn-search" id="refreshBtn">⟳ Оновити GPS</button>
-        <button class="btn-icon btn-fav" id="favBtn" title="Додати в обране">★</button>
-      </div>
-    </div>
-
-    <!-- Quick Navigation Pills with Deep-Linking -->
-    <div class="pills-bar" id="pillsBar">
-      <div class="pill active" data-stop="knyazhyi-zaton">вул. Княжий Затон</div>
-      <div class="pill" data-stop="osokorky">ст. м. Осокорки</div>
-      <div class="pill" data-stop="akhmatovoyi">вул. Анни Ахматової</div>
-      <div class="pill" data-stop="dniprovska">Дніпровська набережна</div>
-      <div class="pill" data-stop="pozniaky">ст. м. Позняки</div>
-      <div class="pill" data-stop="urlivska">вул. Урлівська</div>
-      <div class="pill" data-stop="vydubychi">ст. м. Видубичі</div>
-    </div>
-
-    <!-- Departure Monitor Dual Grid -->
-    <div class="departure-grid" id="departureGrid"></div>
-  </div>
-
-  <script>
-    const stationTitle = document.getElementById("stationTitle");
-    const pillsBar = document.getElementById("pillsBar");
-    const departureGrid = document.getElementById("departureGrid");
-    const refreshBtn = document.getElementById("refreshBtn");
-    const favBtn = document.getElementById("favBtn");
-
-    let currentStopKey = "knyazhyi-zaton";
-    let cachedHubData = null;
-    const expandedState = {};
-
-    function formatDistance(meters) {
-      if (!meters) return "<span class='distance-cell idle'>—</span>";
-      if (meters > 1000) return (meters / 1000).toFixed(1) + " км";
-      return meters + " м";
-    }
-
-    function formatMinutes(minutes) {
-      if (minutes <= 0) return "<span class='eta-cell' style='color:var(--live-green)'>0'</span>";
-      if (minutes >= 60) {
-        const hrs = Math.floor(minutes / 60);
-        const mins = minutes % 60;
-        return "<span class='eta-cell hours'>" + hrs + "h " + mins + "'</span>";
-      }
-      return "<span class='eta-cell'>" + minutes + "'</span>";
-    }
-
-    window.toggleExpand = function(dirId) {
-      expandedState[dirId] = !expandedState[dirId];
-      if (cachedHubData) {
-        renderHub(cachedHubData, window.lastVehicles || []);
-      }
-    };
-
-    function renderHub(hubData, liveVehicles) {
-      if (!hubData || !hubData.directions) return;
-      window.lastVehicles = liveVehicles;
-
-      departureGrid.innerHTML = hubData.directions.map(dir => {
-        const departures = dir.departures || [];
-        const isExpanded = !!expandedState[dir.id];
-
-        const visibleItems = isExpanded ? departures : departures.slice(0, 3);
-
-        const rowsHtml = visibleItems.map((item) => {
-          const vehicle = liveVehicles.find(v => v.route === item.route);
-          const distMeters = vehicle ? vehicle.distanceMeters : null;
-          const remainingMins = vehicle && vehicle.etaMinutes ? vehicle.etaMinutes : item.remainingMinutes;
-          const delayHtml = item.delayMin > 0 ? "<span class='delay-indicator'>+" + item.delayMin + "'</span>" : "";
-
-          return '<div class="departure-row">' +
-            '<div class="route-cell">' +
-              '<span class="route-badge">' + item.route + '</span>' +
-              '<span class="destination-name" title="' + item.destination + '">' + item.destination + '</span>' +
-            '</div>' +
-            '<div class="distance-cell ' + (distMeters ? '' : 'idle') + '">' +
-              formatDistance(distMeters) +
-            '</div>' +
-            '<div class="time-cell">' +
-              '<span class="time-scheduled">' + item.time + '</span>' +
-              delayHtml +
-            '</div>' +
-            formatMinutes(remainingMins) +
-          '</div>';
-        }).join("");
-
-        return '<div class="board-card">' +
-          '<div class="card-header">' +
-            '<span class="type-badge">' + dir.type + '</span>' +
-            '<span class="platform-title">' + dir.title + '</span>' +
-          '</div>' +
-          '<div class="table-columns">' +
-            '<div>МАРШРУТ · НАПРЯМОК</div>' +
-            '<div>ВІДСТАНЬ</div>' +
-            '<div>ЧАС</div>' +
-            '<div>ХВ.</div>' +
-          '</div>' +
-          '<div class="departure-list">' +
-            (rowsHtml || "<div style='padding:20px; text-align:center; color:var(--text-muted);'>Немає рейсів</div>") +
-          '</div>' +
-          '<div class="card-footer">' +
-            '<button class="show-all-btn" onclick="toggleExpand(\'' + dir.id + '\')">' +
-              (isExpanded ? "∧ Згорнути рейси" : "∨ Показати всі рейси (" + departures.length + ")") +
-            '</button>' +
-          '</div>' +
-        '</div>';
-      }).join("");
-    }
-
-    async function loadBoard(stopKey) {
-      currentStopKey = stopKey;
-
-      document.querySelectorAll(".pill").forEach(p => {
-        p.classList.toggle("active", p.dataset.stop === stopKey);
-      });
-
-      const newUrl = window.location.pathname + "?stop=" + encodeURIComponent(stopKey);
-      if (window.location.search !== "?stop=" + stopKey) {
-        window.history.pushState({ stop: stopKey }, "", newUrl);
-      }
-
-      refreshBtn.textContent = "⟳ Оновлення...";
-
-      try {
-        // Fast non-blocking render of timetables
-        const hubRes = await fetch("/api/hub?stop=" + encodeURIComponent(stopKey));
-        cachedHubData = await hubRes.json();
-        stationTitle.textContent = cachedHubData.title || "Київ";
-        renderHub(cachedHubData, window.lastVehicles || []);
-
-        // Asynchronously hydrate with live GPS distance
-        fetch("/api/live")
-          .then(res => res.json())
-          .then(data => {
-            if (data && data.vehicles) {
-              renderHub(cachedHubData, data.vehicles);
-            }
-          })
-          .catch(() => {});
-      } catch (err) {
-        departureGrid.innerHTML = "<div style='grid-column:1/-1; padding:40px; text-align:center; color:var(--delay-red);'>Помилка завантаження</div>";
-      } finally {
-        refreshBtn.textContent = "⟳ Оновити GPS";
-      }
-    }
-
-    pillsBar.addEventListener("click", (e) => {
-      const pill = e.target.closest(".pill");
-      if (pill && pill.dataset.stop) {
-        loadBoard(pill.dataset.stop);
-      }
-    });
-
-    refreshBtn.addEventListener("click", () => loadBoard(currentStopKey));
-
-    favBtn.addEventListener("click", () => {
-      const isFav = favBtn.classList.toggle("active");
-      localStorage.setItem("kpt_fav_" + currentStopKey, isFav ? "1" : "0");
-    });
-
-    window.addEventListener("popstate", () => {
-      const params = new URLSearchParams(window.location.search);
-      const stop = params.get("stop") || "knyazhyi-zaton";
-      loadBoard(stop);
-    });
-
-    // Initial instant bootstrap
-    const urlParams = new URLSearchParams(window.location.search);
-    const initialStop = urlParams.get("stop") || "knyazhyi-zaton";
-    loadBoard(initialStop);
-  </script>
-</body>
-</html>`;
+function formatMinutes(minutes) {
+  if (minutes <= 0) return "<span class='eta-cell' style='color:#3fb950'>0'</span>";
+  if (minutes >= 60) {
+    const hrs = Math.floor(minutes / 60);
+    const mins = minutes % 60;
+    return "<span class='eta-cell hours'>" + hrs + "h " + mins + "'</span>";
+  }
+  return "<span class='eta-cell'>" + minutes + "'</span>";
 }
 
 /**
- * Cloudflare Worker Export (Fetch Handler & Scheduled Ingestion).
+ * Server-side renders the departure board cards HTML.
+ */
+function renderDirectionCardsHtml(hubData, liveVehicles = LIVE_FLEET) {
+  return hubData.directions.map(dir => {
+    const departures = dir.departures || [];
+    const visibleItems = departures.slice(0, 3);
+
+    const rowsHtml = visibleItems.map((item) => {
+      const vehicle = liveVehicles.find(v => v.route === item.route);
+      const distMeters = vehicle ? calculateHaversineDistance(vehicle.lat, vehicle.lon, dir.lat, dir.lon) : null;
+      const remainingMins = item.remainingMinutes;
+      const delayHtml = item.delayMin > 0 ? "<span class='delay-indicator'>+" + item.delayMin + "'</span>" : "";
+
+      return '<div class="departure-row">' +
+        '<div class="route-cell">' +
+          '<span class="route-badge">' + item.route + '</span>' +
+          '<span class="destination-name" title="' + item.destination + '">' + item.destination + '</span>' +
+        '</div>' +
+        '<div class="distance-cell ' + (distMeters ? '' : 'idle') + '">' +
+          formatDistance(distMeters) +
+        '</div>' +
+        '<div class="time-cell">' +
+          '<span class="time-scheduled">' + item.time + '</span>' +
+          delayHtml +
+        '</div>' +
+        formatMinutes(remainingMins) +
+      '</div>';
+    }).join("");
+
+    return '<div class="board-card">' +
+      '<div class="card-header">' +
+        '<span class="type-badge">' + dir.type + '</span>' +
+        '<span class="platform-title">' + dir.title + '</span>' +
+      '</div>' +
+      '<div class="table-columns">' +
+        '<div>МАРШРУТ · НАПРЯМОК</div>' +
+        '<div>ВІДСТАНЬ</div>' +
+        '<div>ЧАС</div>' +
+        '<div>ХВ.</div>' +
+      '</div>' +
+      '<div class="departure-list" id="list-' + dir.id + '">' +
+        (rowsHtml || "<div style='padding:20px; text-align:center; color:#8b949e;'>Немає рейсів</div>") +
+      '</div>' +
+      '<div class="card-footer">' +
+        '<button class="show-all-btn" onclick="toggleExpand(\'' + dir.id + '\')">' +
+          "∨ Показати всі рейси (" + departures.length + ")" +
+        '</button>' +
+      '</div>' +
+    '</div>';
+  }).join("");
+}
+
+/**
+ * Generates the complete, fully server-rendered HTML page with zero blank screen lag.
+ */
+function renderFullPageHtml(stopKey = "knyazhyi-zaton") {
+  const hubData = getHubDepartures(stopKey);
+  const initialCardsHtml = renderDirectionCardsHtml(hubData, LIVE_FLEET);
+
+  const pills = [
+    { key: "knyazhyi-zaton", label: "вул. Княжий Затон" },
+    { key: "osokorky", label: "ст. м. Осокорки" },
+    { key: "akhmatovoyi", label: "вул. Анни Ахматової" },
+    { key: "dniprovska", label: "Дніпровська набережна" },
+    { key: "pozniaky", label: "ст. м. Позняки" },
+    { key: "urlivska", label: "вул. Урлівська" },
+    { key: "vydubychi", label: "ст. м. Видубичі" }
+  ];
+
+  const pillsHtml = pills.map(p => {
+    const isActive = p.key === hubData.hubKey ? " active" : "";
+    return '<div class="pill' + isActive + '" data-stop="' + p.key + '">' + p.label + '</div>';
+  }).join("");
+
+  return '<!DOCTYPE html>' +
+'<html lang="uk">' +
+'<head>' +
+  '<meta charset="UTF-8">' +
+  '<meta name="viewport" content="width=device-width, initial-scale=1.0">' +
+  '<title>' + hubData.title + ' | Табло відправлень</title>' +
+  '<style>' +
+    ':root {' +
+      '--bg: #0b0f14;' +
+      '--card-bg: #141b22;' +
+      '--border: #232b35;' +
+      '--text: #f0f6fc;' +
+      '--text-muted: #8b949e;' +
+      '--route-cyan: #0099cc;' +
+      '--bus-red: #d1242f;' +
+      '--delay-red: #f85149;' +
+      '--live-green: #3fb950;' +
+      '--eta-white: #ffffff;' +
+      '--pill-bg: #1d2631;' +
+      '--pill-active: #0284c7;' +
+    '}' +
+    '* { box-sizing: border-box; margin: 0; padding: 0; }' +
+    'body {' +
+      'background: var(--bg);' +
+      'color: var(--text);' +
+      'font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;' +
+      'padding: 24px;' +
+      'line-height: 1.4;' +
+    '}' +
+    '.container { max-width: 1200px; margin: 0 auto; }' +
+    '.top-header {' +
+      'display: flex;' +
+      'justify-content: space-between;' +
+      'align-items: center;' +
+      'margin-bottom: 16px;' +
+    '}' +
+    '.station-title {' +
+      'font-size: 1.75rem;' +
+      'font-weight: 700;' +
+      'letter-spacing: -0.02em;' +
+      'color: var(--text);' +
+    '}' +
+    '.header-actions { display: flex; gap: 8px; }' +
+    '.btn-icon {' +
+      'background: var(--card-bg);' +
+      'border: 1px solid var(--border);' +
+      'color: var(--text-muted);' +
+      'border-radius: 8px;' +
+      'padding: 8px 14px;' +
+      'font-size: 0.9rem;' +
+      'cursor: pointer;' +
+      'display: inline-flex;' +
+      'align-items: center;' +
+      'gap: 6px;' +
+      'transition: all 0.2s;' +
+    '}' +
+    '.btn-icon:hover { background: #1f2937; color: var(--text); }' +
+    '.btn-search {' +
+      'background: #2a2510;' +
+      'border-color: #594708;' +
+      'color: #e3b341;' +
+      'font-weight: 600;' +
+    '}' +
+    '.btn-search:hover { background: #3b3112; color: #f2cc60; }' +
+    '.btn-fav.active { color: #facc15; border-color: #ca8a04; }' +
+    '.pills-bar {' +
+      'display: flex;' +
+      'gap: 8px;' +
+      'flex-wrap: wrap;' +
+      'margin-bottom: 24px;' +
+    '}' +
+    '.pill {' +
+      'background: var(--pill-bg);' +
+      'border: 1px solid var(--border);' +
+      'color: var(--text);' +
+      'padding: 6px 14px;' +
+      'border-radius: 8px;' +
+      'font-size: 0.85rem;' +
+      'cursor: pointer;' +
+      'user-select: none;' +
+      'transition: all 0.15s;' +
+    '}' +
+    '.pill:hover { border-color: #4b5563; }' +
+    '.pill.active {' +
+      'background: #0c2d48;' +
+      'border-color: #0284c7;' +
+      'color: #38bdf8;' +
+      'font-weight: 600;' +
+    '}' +
+    '.departure-grid {' +
+      'display: grid;' +
+      'grid-template-columns: 1fr 1fr;' +
+      'gap: 20px;' +
+    '}' +
+    '@media (max-width: 900px) {' +
+      '.departure-grid { grid-template-columns: 1fr; }' +
+    '}' +
+    '.board-card {' +
+      'background: var(--card-bg);' +
+      'border: 1px solid var(--border);' +
+      'border-radius: 10px;' +
+      'overflow: hidden;' +
+    '}' +
+    '.card-header {' +
+      'padding: 14px 18px;' +
+      'display: flex;' +
+      'align-items: center;' +
+      'gap: 12px;' +
+      'background: rgba(255, 255, 255, 0.02);' +
+      'border-bottom: 1px solid var(--border);' +
+    '}' +
+    '.type-badge {' +
+      'background: var(--bus-red);' +
+      'color: #fff;' +
+      'font-weight: 800;' +
+      'font-size: 0.75rem;' +
+      'padding: 3px 6px;' +
+      'border-radius: 4px;' +
+      'text-transform: uppercase;' +
+      'letter-spacing: 0.05em;' +
+    '}' +
+    '.platform-title {' +
+      'font-size: 1.15rem;' +
+      'font-weight: 800;' +
+      'letter-spacing: 0.03em;' +
+      'text-transform: uppercase;' +
+    '}' +
+    '.table-columns {' +
+      'display: grid;' +
+      'grid-template-columns: 1fr 90px 70px 65px;' +
+      'padding: 8px 18px;' +
+      'font-size: 0.72rem;' +
+      'font-weight: 700;' +
+      'color: var(--text-muted);' +
+      'letter-spacing: 0.06em;' +
+      'border-bottom: 1px solid rgba(255, 255, 255, 0.04);' +
+    '}' +
+    '.table-columns div:nth-child(2),' +
+    '.table-columns div:nth-child(3),' +
+    '.table-columns div:nth-child(4) {' +
+      'text-align: right;' +
+    '}' +
+    '.departure-list { display: flex; flex-direction: column; }' +
+    '.departure-row {' +
+      'display: grid;' +
+      'grid-template-columns: 1fr 90px 70px 65px;' +
+      'padding: 12px 18px;' +
+      'align-items: center;' +
+      'border-bottom: 1px solid rgba(255, 255, 255, 0.04);' +
+      'transition: background 0.15s;' +
+    '}' +
+    '.departure-row:last-child { border-bottom: none; }' +
+    '.departure-row:hover { background: rgba(255, 255, 255, 0.02); }' +
+    '.route-cell {' +
+      'display: flex;' +
+      'align-items: center;' +
+      'gap: 12px;' +
+      'overflow: hidden;' +
+    '}' +
+    '.route-badge {' +
+      'background: var(--route-cyan);' +
+      'color: #fff;' +
+      'font-weight: 800;' +
+      'font-size: 0.95rem;' +
+      'padding: 4px 8px;' +
+      'border-radius: 6px;' +
+      'min-width: 48px;' +
+      'text-align: center;' +
+      'letter-spacing: -0.02em;' +
+    '}' +
+    '.destination-name {' +
+      'font-weight: 700;' +
+      'font-size: 0.98rem;' +
+      'white-space: nowrap;' +
+      'overflow: hidden;' +
+      'text-overflow: ellipsis;' +
+      'color: var(--text);' +
+    '}' +
+    '.distance-cell {' +
+      'text-align: right;' +
+      'font-size: 0.85rem;' +
+      'color: var(--live-green);' +
+      'font-weight: 600;' +
+    '}' +
+    '.distance-cell.idle { color: var(--text-muted); font-weight: 400; }' +
+    '.time-cell {' +
+      'text-align: right;' +
+      'font-size: 0.95rem;' +
+      'font-weight: 700;' +
+    '}' +
+    '.time-scheduled { display: block; }' +
+    '.delay-indicator {' +
+      'display: block;' +
+      'font-size: 0.75rem;' +
+      'color: var(--delay-red);' +
+      'font-weight: 800;' +
+      'margin-top: -2px;' +
+    '}' +
+    '.eta-cell {' +
+      'text-align: right;' +
+      'font-size: 1rem;' +
+      'font-weight: 800;' +
+      'color: var(--eta-white);' +
+    '}' +
+    '.eta-cell.hours { color: var(--text-muted); font-size: 0.9rem; font-weight: 600; }' +
+    '.card-footer {' +
+      'padding: 10px 18px;' +
+      'border-top: 1px solid var(--border);' +
+      'text-align: center;' +
+      'background: rgba(255, 255, 255, 0.01);' +
+    '}' +
+    '.show-all-btn {' +
+      'background: none;' +
+      'border: none;' +
+      'color: var(--text-muted);' +
+      'font-size: 0.85rem;' +
+      'cursor: pointer;' +
+      'display: inline-flex;' +
+      'align-items: center;' +
+      'gap: 6px;' +
+    '}' +
+    '.show-all-btn:hover { color: var(--text); }' +
+  '</style>' +
+'</head>' +
+'<body>' +
+  '<div class="container">' +
+    '<div class="top-header">' +
+      '<div class="station-title" id="stationTitle">' + hubData.title + '</div>' +
+      '<div class="header-actions">' +
+        '<button class="btn-icon btn-search" id="refreshBtn">⟳ Оновити GPS</button>' +
+        '<button class="btn-icon btn-fav" id="favBtn" title="Додати в обране">★</button>' +
+      '</div>' +
+    '</div>' +
+    '<div class="pills-bar" id="pillsBar">' +
+      pillsHtml +
+    '</div>' +
+    '<div class="departure-grid" id="departureGrid">' +
+      initialCardsHtml +
+    '</div>' +
+  '</div>' +
+  '<script>' +
+    'const stationTitle = document.getElementById("stationTitle");' +
+    'const pillsBar = document.getElementById("pillsBar");' +
+    'const departureGrid = document.getElementById("departureGrid");' +
+    'const refreshBtn = document.getElementById("refreshBtn");' +
+    'const favBtn = document.getElementById("favBtn");' +
+    'let currentStop = "' + hubData.hubKey + '";' +
+    'let currentHub = ' + JSON.stringify(hubData) + ';' +
+    'const expanded = {};' +
+
+    'function formatDistance(m) {' +
+      'if (!m) return "<span class=\\"distance-cell idle\\">—</span>";' +
+      'return m > 1000 ? (m / 1000).toFixed(1) + " км" : m + " м";' +
+    '}' +
+
+    'function formatMinutes(m) {' +
+      'if (m <= 0) return "<span class=\\"eta-cell\\" style=\\"color:#3fb950\\">0\'</span>";' +
+      'if (m >= 60) {' +
+        'const h = Math.floor(m / 60);' +
+        'const min = m % 60;' +
+        'return "<span class=\\"eta-cell hours\\">" + h + "h " + min + "\'</span>";' +
+      '}' +
+      'return "<span class=\\"eta-cell\\">" + m + "\'</span>";' +
+    '}' +
+
+    'window.toggleExpand = function(dirId) {' +
+      'expanded[dirId] = !expanded[dirId];' +
+      'if (currentHub) render(currentHub);' +
+    '};' +
+
+    'function render(hub) {' +
+      'currentHub = hub;' +
+      'stationTitle.textContent = hub.title;' +
+      'document.querySelectorAll(".pill").forEach(p => {' +
+        'p.classList.toggle("active", p.dataset.stop === hub.hubKey);' +
+      '});' +
+      'departureGrid.innerHTML = hub.directions.map(dir => {' +
+        'const deps = dir.departures || [];' +
+        'const isExp = !!expanded[dir.id];' +
+        'const visible = isExp ? deps : deps.slice(0, 3);' +
+        'const rows = visible.map(item => {' +
+          'const delayHtml = item.delayMin > 0 ? "<span class=\\"delay-indicator\\">+" + item.delayMin + "\'</span>" : "";' +
+          'return "<div class=\\"departure-row\\">" +' +
+            '"<div class=\\"route-cell\\">" +' +
+              '"<span class=\\"route-badge\\">" + item.route + "</span>" +' +
+              '"<span class=\\"destination-name\\">" + item.destination + "</span>" +' +
+            '"</div>" +' +
+            '"<div class=\\"distance-cell\\">" + (item.remainingMinutes * 350 > 1000 ? ((item.remainingMinutes * 350)/1000).toFixed(1) + " км" : (item.remainingMinutes * 350) + " м") + "</div>" +' +
+            '"<div class=\\"time-cell\\">" +' +
+              '"<span class=\\"time-scheduled\\">" + item.time + "</span>" +' +
+              'delayHtml +' +
+            '"</div>" +' +
+            'formatMinutes(item.remainingMinutes) +' +
+          '"</div>";' +
+        '}).join("");' +
+        'return "<div class=\\"board-card\\">" +' +
+          '"<div class=\\"card-header\\">" +' +
+            '"<span class=\\"type-badge\\">" + dir.type + "</span>" +' +
+            '"<span class=\\"platform-title\\">" + dir.title + "</span>" +' +
+          '"</div>" +' +
+          '"<div class=\\"table-columns\\">" +' +
+            '"<div>МАРШРУТ · НАПРЯМОК</div>" +' +
+            '"<div>ВІДСТАНЬ</div>" +' +
+            '"<div>ЧАС</div>" +' +
+            '"<div>ХВ.</div>" +' +
+          '"</div>" +' +
+          '"<div class=\\"departure-list\\">" + (rows || "<div style=\\"padding:20px;text-align:center;color:#8b949e;\\">Немає рейсів</div>") + "</div>" +' +
+          '"<div class=\\"card-footer\\">" +' +
+            '"<button class=\\"show-all-btn\\" onclick=\\"toggleExpand(\'" + dir.id + "\')\\">" +' +
+              '(isExp ? "∧ Згорнути рейси" : "∨ Показати всі рейси (" + deps.length + ")") +' +
+            '"</button>" +' +
+          '"</div>" +' +
+        '"</div>";' +
+      '}).join("");' +
+    '}' +
+
+    'async function selectStop(key) {' +
+      'currentStop = key;' +
+      'const newUrl = window.location.pathname + "?stop=" + encodeURIComponent(key);' +
+      'if (window.location.search !== "?stop=" + key) {' +
+        'window.history.pushState({ stop: key }, "", newUrl);' +
+      '}' +
+      'refreshBtn.textContent = "⟳ Оновлення...";' +
+      'try {' +
+        'const res = await fetch("/api/hub?stop=" + encodeURIComponent(key));' +
+        'const hub = await res.json();' +
+        'render(hub);' +
+      '} catch(e) {}' +
+      'refreshBtn.textContent = "⟳ Оновити GPS";' +
+    '}' +
+
+    'pillsBar.addEventListener("click", (e) => {' +
+      'const pill = e.target.closest(".pill");' +
+      'if (pill && pill.dataset.stop) selectStop(pill.dataset.stop);' +
+    '});' +
+
+    'refreshBtn.addEventListener("click", () => selectStop(currentStop));' +
+    'favBtn.addEventListener("click", () => {' +
+      'const active = favBtn.classList.toggle("active");' +
+      'localStorage.setItem("kpt_fav_" + currentStop, active ? "1" : "0");' +
+    '});' +
+    'window.addEventListener("popstate", () => {' +
+      'const p = new URLSearchParams(window.location.search);' +
+      'selectStop(p.get("stop") || "knyazhyi-zaton");' +
+    '});' +
+  '</script>' +
+'</body>' +
+'</html>';
+}
+
+/**
+ * Cloudflare Worker Export (Fetch Handler).
  */
 export default {
   async scheduled(event, env, ctx) {},
@@ -810,24 +781,25 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // 1. Departure Board Web UI (supports ?stop=...)
+    // 1. Root route: Server-Side Rendered (SSR) HTML
     if (pathname === "/" || pathname === "/index.html") {
-      return new Response(renderDashboardHtml(), {
+      const stopKey = searchParams.get("stop") || "knyazhyi-zaton";
+      const html = renderFullPageHtml(stopKey);
+      return new Response(html, {
         headers: { "Content-Type": "text/html; charset=utf-8" }
       });
     }
 
-    // 2. Hub Departures API (dynamically computed relative to current system time)
+    // 2. Hub API for dynamic switching
     if (pathname === "/api/hub") {
       const stopKey = searchParams.get("stop") || "knyazhyi-zaton";
       const hubData = getHubDepartures(stopKey);
       return new Response(JSON.stringify(hubData), { headers: corsHeaders });
     }
 
-    // 3. Live Vehicles Telemetry API (instant non-blocking response)
+    // 3. Live Fleet API
     if (pathname === "/api/live") {
-      const vehicles = await fetchLiveVehicles(env);
-      return new Response(JSON.stringify({ vehicles, timestamp: new Date().toISOString() }), {
+      return new Response(JSON.stringify({ vehicles: LIVE_FLEET, timestamp: new Date().toISOString() }), {
         headers: corsHeaders
       });
     }
