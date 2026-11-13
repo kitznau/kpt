@@ -110,16 +110,75 @@ const ROUTE_FULL_STOPS = {
     { name: "вул. Колекторна", offset: 18, status: "intermediate" },
     { name: "вул. Підлипка", offset: 21, status: "destination" }
   ],
-  // Bus 35: Pozniaky -> Pidlypka
-  "35_FROM_POZNIAKY": [
+  // Tram arrival / drop-off zone at Pozniaky loop
+  "TRAM_ARRIVAL": [
+    { name: "ст. м. 'Позняки' (зона висадки пасажирів)", offset: 0, status: "current" },
+    { name: "Технічний розворотний тупик", offset: 2, status: "destination" }
+  ],
+  // Bus 45: Pozniaky -> Darnytsia Metro
+  "45_TO_DARNITSYA": [
+    { name: "ст. м. 'Позняки'", offset: 0, status: "current" },
+    { name: "вул. Михайла Драгоманова", offset: 2, status: "intermediate" },
+    { name: "вул. Анни Ахматової", offset: 4, status: "intermediate" },
+    { name: "просп. Петра Григоренка", offset: 6, status: "intermediate" },
+    { name: "вул. Тепловозна", offset: 9, status: "intermediate" },
+    { name: "вул. Привокзальна", offset: 12, status: "intermediate" },
+    { name: "Дарницький вокзал", offset: 15, status: "intermediate" },
+    { name: "Дарницька площа", offset: 18, status: "intermediate" },
+    { name: "вул. Будівельників", offset: 21, status: "intermediate" },
+    { name: "ст. м. 'Дарниця'", offset: 25, status: "destination" }
+  ],
+  // Bus 45: Pozniaky -> Kharkivska Metro
+  "45_TO_KHARKIVSKA": [
     { name: "ст. м. 'Позняки'", offset: 0, status: "current" },
     { name: "просп. Петра Григоренка", offset: 2, status: "intermediate" },
-    { name: "вул. Михайла Гришка", offset: 4, status: "intermediate" },
-    { name: "вул. Олександра Мишуги", offset: 6, status: "intermediate" },
-    { name: "вул. Лариси Руденко", offset: 8, status: "intermediate" },
-    { name: "вул. Вишняківська", offset: 10, status: "intermediate" },
-    { name: "вул. Колекторна", offset: 12, status: "intermediate" },
-    { name: "вул. Підлипка", offset: 15, status: "destination" }
+    { name: "вул. Олександра Мишуги", offset: 5, status: "intermediate" },
+    { name: "вул. Ревуцького", offset: 8, status: "intermediate" },
+    { name: "ст. м. 'Харківська'", offset: 12, status: "destination" }
+  ],
+  // Bus 27T: Pozniaky -> Miloslavska (Troieshchyna)
+  "27T_TO_MILOSLAVSKA": [
+    { name: "ст. м. 'Позняки'", offset: 0, status: "current" },
+    { name: "вул. Михайла Драгоманова", offset: 2, status: "intermediate" },
+    { name: "вул. Анни Ахматової", offset: 5, status: "intermediate" },
+    { name: "Дарницька площа", offset: 15, status: "intermediate" },
+    { name: "ст. м. 'Чернігівська'", offset: 20, status: "intermediate" },
+    { name: "вул. Миколи Закревського", offset: 30, status: "intermediate" },
+    { name: "вул. Сержа Лифаря", offset: 38, status: "intermediate" },
+    { name: "вул. Милославська", offset: 45, status: "destination" }
+  ],
+  // Bus 91T: Pozniaky -> Holosiivska Metro
+  "91T_TO_HOLOSIIVSKA": [
+    { name: "ст. м. 'Позняки'", offset: 0, status: "current" },
+    { name: "ст. м. 'Осокорки'", offset: 2, status: "intermediate" },
+    { name: "ст. м. 'Славутич'", offset: 5, status: "intermediate" },
+    { name: "ст. м. 'Видубичі'", offset: 10, status: "intermediate" },
+    { name: "Автовокзал 'Київ'", offset: 15, status: "intermediate" },
+    { name: "ст. м. 'Деміївська'", offset: 18, status: "intermediate" },
+    { name: "ст. м. 'Голосіївська'", offset: 22, status: "destination" }
+  ],
+  // Metro Line M3: Pozniaky -> Syrets (Syretsko-Pecherska line)
+  "M3_TO_SYRETS": [
+    { name: "ст. м. 'Позняки'", offset: 0, status: "current" },
+    { name: "ст. м. 'Осокорки'", offset: 2, status: "intermediate" },
+    { name: "ст. м. 'Славутич'", offset: 4, status: "intermediate" },
+    { name: "ст. м. 'Видубичі'", offset: 7, status: "intermediate" },
+    { name: "ст. м. 'Звіринецька'", offset: 10, status: "intermediate" },
+    { name: "ст. м. 'Печерська'", offset: 13, status: "intermediate" },
+    { name: "ст. м. 'Кловська'", offset: 15, status: "intermediate" },
+    { name: "ст. м. 'Палац Спорту'", offset: 18, status: "intermediate" },
+    { name: "ст. м. 'Золоті Ворота'", offset: 21, status: "intermediate" },
+    { name: "ст. м. 'Лук'янівська'", offset: 24, status: "intermediate" },
+    { name: "ст. м. 'Дорогожичі'", offset: 27, status: "intermediate" },
+    { name: "ст. м. 'Сирець'", offset: 30, status: "destination" }
+  ],
+  // Metro Line M3: Pozniaky -> Chervonyi Khutir
+  "M3_TO_CHERVONYI_KHUTIR": [
+    { name: "ст. м. 'Позняки'", offset: 0, status: "current" },
+    { name: "ст. м. 'Харківська'", offset: 3, status: "intermediate" },
+    { name: "ст. м. 'Вирлиця'", offset: 5, status: "intermediate" },
+    { name: "ст. м. 'Бориспільська'", offset: 8, status: "intermediate" },
+    { name: "ст. м. 'Червоний Хутір'", offset: 11, status: "destination" }
   ],
   // Night Bus 134N: Knyazhyi Zaton -> Pavla Tychyny
   "134N_TO_TYCHYNY": [
@@ -241,6 +300,50 @@ const LIVE_FLEET = [
     lat: 50.4030,
     lon: 30.6310,
     speedKmh: 20
+  },
+  {
+    vehicleId: "4120",
+    route: "45",
+    boardNumber: "4120",
+    licensePlate: "AA 4120 AA",
+    model: "МАЗ-203.069",
+    isLowFloor: true,
+    lat: 50.4005,
+    lon: 30.6355,
+    speedKmh: 22
+  },
+  {
+    vehicleId: "4815",
+    route: "27Т",
+    boardNumber: "4815",
+    licensePlate: "AA 4815 KA",
+    model: "МАЗ-215.069 (зчленований)",
+    isLowFloor: true,
+    lat: 50.3995,
+    lon: 30.6338,
+    speedKmh: 20
+  },
+  {
+    vehicleId: "1409",
+    route: "91Т",
+    boardNumber: "1409",
+    licensePlate: "AA 1409 KM",
+    model: "Богдан А701.32",
+    isLowFloor: true,
+    lat: 50.3970,
+    lon: 30.6320,
+    speedKmh: 25
+  },
+  {
+    vehicleId: "023",
+    route: "М3",
+    boardNumber: "023",
+    licensePlate: "Поїзд № 023 (5 вагонів)",
+    model: "Вагони 81-7021/7022 («Крюківець»)",
+    isLowFloor: true,
+    lat: 50.3990,
+    lon: 30.6345,
+    speedKmh: 55
   }
 ];
 
@@ -362,14 +465,14 @@ const HUBS = {
       }
     ]
   },
-  // Normalized Pozniaky: Bus 42 is removed; contains only real stops: Tram 8, Tram 28D & Bus 35
+  // Full transport hub Pozniaky: 2 tram stops, 3 bus stops, and 2 metro platforms (Syretsko-Pecherska line)
   "pozniaky": {
     name: "ст. м. Позняки",
     title: "Київ, ст. м. «Позняки»",
     directions: [
       {
-        id: "pz-dir-1",
-        title: "ПЛАТФОРМА 1 · ТРАМВАЇ (ДО ДАРНИЦІ / ЛІСОВОЇ)",
+        id: "pz-tram-1",
+        title: "ТРАМВАЙ · ЗУПИНКА 1 (КІЛЬЦЕ / ПОСАДКА)",
         type: "ТРАМ",
         lat: 50.3980,
         lon: 30.6340,
@@ -380,14 +483,72 @@ const HUBS = {
         ]
       },
       {
-        id: "pz-dir-2",
-        title: "ПЛАТФОРМА 2 · АВТОБУСИ (ДО ВУЛ. ПІДЛИПКА)",
-        type: "АВТ",
-        lat: 50.3985,
-        lon: 30.6345,
+        id: "pz-tram-2",
+        title: "ТРАМВАЙ · ЗУПИНКА 2 (ВИСАДКА ПАСАЖИРІВ)",
+        type: "ТРАМ",
+        lat: 50.3982,
+        lon: 30.6342,
         departures: [
-          { route: "35", destination: "вул. Підлипка", timeOffsetMin: 6, delayMin: 0, stopsKey: "35_FROM_POZNIAKY", defaultBoard: "3301" },
-          { route: "35", destination: "вул. Підлипка", timeOffsetMin: 26, delayMin: 2, stopsKey: "35_FROM_POZNIAKY", defaultBoard: "3308" }
+          { route: "8", destination: "ст. м. 'Позняки' (висадка)", timeOffsetMin: 2, delayMin: 0, stopsKey: "TRAM_ARRIVAL", defaultBoard: "8019" },
+          { route: "28Д", destination: "ст. м. 'Позняки' (висадка)", timeOffsetMin: 12, delayMin: 0, stopsKey: "TRAM_ARRIVAL", defaultBoard: "8025" }
+        ]
+      },
+      {
+        id: "pz-bus-1",
+        title: "АВТОБУС · ЗУПИНКА 1 (ПРОСП. ГРИГОРЕНКА · НА ПІВНІЧ)",
+        type: "АВТ",
+        lat: 50.3988,
+        lon: 30.6348,
+        departures: [
+          { route: "45", destination: "ст. м. 'Дарниця'", timeOffsetMin: 5, delayMin: 0, stopsKey: "45_TO_DARNITSYA", defaultBoard: "4120" },
+          { route: "27Т", destination: "вул. Милославська", timeOffsetMin: 14, delayMin: 1, stopsKey: "27T_TO_MILOSLAVSKA", defaultBoard: "4815" },
+          { route: "45", destination: "ст. м. 'Дарниця'", timeOffsetMin: 25, delayMin: 0, stopsKey: "45_TO_DARNITSYA", defaultBoard: "4124" }
+        ]
+      },
+      {
+        id: "pz-bus-2",
+        title: "АВТОБУС · ЗУПИНКА 2 (ПРОСП. ГРИГОРЕНКА · НА ПІВДЕНЬ)",
+        type: "АВТ",
+        lat: 50.3986,
+        lon: 30.6344,
+        departures: [
+          { route: "45", destination: "ст. м. 'Харківська'", timeOffsetMin: 8, delayMin: 0, stopsKey: "45_TO_KHARKIVSKA", defaultBoard: "4122" },
+          { route: "45", destination: "ст. м. 'Харківська'", timeOffsetMin: 28, delayMin: 1, stopsKey: "45_TO_KHARKIVSKA", defaultBoard: "4126" }
+        ]
+      },
+      {
+        id: "pz-bus-3",
+        title: "АВТОБУС · ЗУПИНКА 3 (ПРОСП. МИКОЛИ БАЖАНА)",
+        type: "АВТ",
+        lat: 50.3983,
+        lon: 30.6335,
+        departures: [
+          { route: "91Т", destination: "ст. м. 'Голосіївська'", timeOffsetMin: 10, delayMin: 0, stopsKey: "91T_TO_HOLOSIIVSKA", defaultBoard: "1409" },
+          { route: "91Т", destination: "ст. м. 'Голосіївська'", timeOffsetMin: 30, delayMin: 2, stopsKey: "91T_TO_HOLOSIIVSKA", defaultBoard: "1415" }
+        ]
+      },
+      {
+        id: "pz-metro-1",
+        title: "МЕТРО · ПЛАТФОРМА 1 (ДО СТ. «СИРЕЦЬ»)",
+        type: "МЕТРО",
+        lat: 50.3981,
+        lon: 30.6341,
+        departures: [
+          { route: "М3", destination: "ст. 'Сирець'", timeOffsetMin: 3, delayMin: 0, stopsKey: "M3_TO_SYRETS", defaultBoard: "023" },
+          { route: "М3", destination: "ст. 'Сирець'", timeOffsetMin: 7, delayMin: 0, stopsKey: "M3_TO_SYRETS", defaultBoard: "041" },
+          { route: "М3", destination: "ст. 'Сирець'", timeOffsetMin: 12, delayMin: 0, stopsKey: "M3_TO_SYRETS", defaultBoard: "017" }
+        ]
+      },
+      {
+        id: "pz-metro-2",
+        title: "МЕТРО · ПЛАТФОРМА 2 (ДО СТ. «ЧЕРВОНИЙ ХУТІР»)",
+        type: "МЕТРО",
+        lat: 50.3981,
+        lon: 30.6341,
+        departures: [
+          { route: "М3", destination: "ст. 'Червоний Хутір'", timeOffsetMin: 4, delayMin: 0, stopsKey: "M3_TO_CHERVONYI_KHUTIR", defaultBoard: "052" },
+          { route: "М3", destination: "ст. 'Червоний Хутір'", timeOffsetMin: 9, delayMin: 0, stopsKey: "M3_TO_CHERVONYI_KHUTIR", defaultBoard: "034" },
+          { route: "М3", destination: "ст. 'Червоний Хутір'", timeOffsetMin: 15, delayMin: 0, stopsKey: "M3_TO_CHERVONYI_KHUTIR", defaultBoard: "028" }
         ]
       }
     ]
@@ -575,10 +736,12 @@ function renderDirectionCardsHtml(hubData, liveVehicles = LIVE_FLEET) {
         '</div>';
       }).join("");
 
+      const routeClass = item.route === "М3" ? "route-badge metro" : (dir.type === "ТРАМ" ? "route-badge tram" : "route-badge");
+
       return '<div class="departure-item-wrapper">' +
         '<div class="departure-row" onclick="toggleTripDetails(\'' + tripId + '\')">' +
           '<div class="route-cell">' +
-            '<span class="route-badge">' + item.route + '</span>' +
+            '<span class="' + routeClass + '">' + item.route + '</span>' +
             '<span class="destination-name">' + item.destination + '</span>' +
           '</div>' +
           '<div class="distance-cell">' +
@@ -599,9 +762,11 @@ function renderDirectionCardsHtml(hubData, liveVehicles = LIVE_FLEET) {
       '</div>';
     }).join("");
 
+    const typeClass = dir.type === "МЕТРО" ? "metro" : (dir.type === "ТРАМ" ? "tram" : "bus");
+
     return '<div class="board-card">' +
       '<div class="card-header">' +
-        '<span class="type-badge">' + dir.type + '</span>' +
+        '<span class="type-badge ' + typeClass + '">' + dir.type + '</span>' +
         '<span class="platform-title">' + dir.title + '</span>' +
       '</div>' +
       '<div class="table-columns">' +
@@ -773,6 +938,9 @@ function renderFullPageHtml(stopKey = "knyazhyi-zaton") {
       'text-transform: uppercase;' +
       'letter-spacing: 0.05em;' +
     '}' +
+    '.type-badge.tram { background: #d97706; }' +
+    '.type-badge.bus { background: var(--bus-red); }' +
+    '.type-badge.metro { background: #16a34a; }' +
     '.platform-title {' +
       'font-size: 1.15rem;' +
       'font-weight: 800;' +
@@ -826,6 +994,8 @@ function renderFullPageHtml(stopKey = "knyazhyi-zaton") {
       'text-align: center;' +
       'letter-spacing: -0.02em;' +
     '}' +
+    '.route-badge.metro { background: #16a34a; }' +
+    '.route-badge.tram { background: #d97706; }' +
     '.destination-name {' +
       'font-weight: 700;' +
       'font-size: 0.98rem;' +
@@ -1058,8 +1228,9 @@ function renderFullPageHtml(stopKey = "knyazhyi-zaton") {
           '}).join("");' +
           'return "<div class=\\"departure-item-wrapper\\">" +' +
             '"<div class=\\"departure-row\\" onclick=\\"toggleTripDetails(\'" + tripId + "\')\\">" +' +
+              'const routeCls = item.route === "М3" ? "route-badge metro" : (dir.type === "ТРАМ" ? "route-badge tram" : "route-badge");' +
               '"<div class=\\"route-cell\\">" +' +
-                '"<span class=\\"route-badge\\">" + item.route + "</span>" +' +
+                '"<span class=\\"" + routeCls + "\\">" + item.route + "</span>" +' +
                 '"<span class=\\"destination-name\\">" + item.destination + "</span>" +' +
               '"</div>" +' +
               '"<div class=\\"distance-cell\\">" + (item.remainingMinutes * 350 > 1000 ? ((item.remainingMinutes * 350)/1000).toFixed(1) + " км" : (item.remainingMinutes * 350) + " м") + "</div>" +' +
@@ -1075,9 +1246,10 @@ function renderFullPageHtml(stopKey = "knyazhyi-zaton") {
             '"</div>" +' +
           '"</div>";' +
         '}).join("");' +
+        'const typeCls = dir.type === "МЕТРО" ? "metro" : (dir.type === "ТРАМ" ? "tram" : "bus");' +
         'return "<div class=\\"board-card\\">" +' +
           '"<div class=\\"card-header\\">" +' +
-            '"<span class=\\"type-badge\\">" + dir.type + "</span>" +' +
+            '"<span class=\\"type-badge " + typeCls + "\\">" + dir.type + "</span>" +' +
             '"<span class=\\"platform-title\\">" + dir.title + "</span>" +' +
           '"</div>" +' +
           '"<div class=\\"table-columns\\">" +' +
