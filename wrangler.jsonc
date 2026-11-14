@@ -1,8 +1,17 @@
 {
   /**
    * Cloudflare Workers Configuration (wrangler.jsonc)
-   * Educational note: Runs in lightweight Edge execution mode without requiring 
-   * external KV namespace provisioning, utilizing native Cloudflare Edge Cache API.
+   * Version: 1.1.0  (pairs with worker.js 3.1.0 and build-index.mjs 1.1.0)
+   *
+   * Notes
+   *  - Secret (NOT stored here):  npx wrangler secret put ADMIN_TOKEN
+   *    It guards /api/admin/import-index and /api/debug-sources.
+   *    The token that was hard-coded in worker.js 3.0 is compromised — use a new value.
+   *  - The Workers Cache API is a no-op on *.workers.dev. Attach a custom domain/route
+   *    to get cross-request edge caching; without it the worker relies on per-isolate
+   *    memos and on the bundled assets/gtfs-index.json (build-index.mjs writes it there).
+   *  - compatibility_date is intentionally unchanged: DecompressionStream("deflate-raw")
+   *    is supported by the Workers runtime without a flag.
    */
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "kpt",
