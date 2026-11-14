@@ -353,6 +353,14 @@ async function cachedJson(key, ttlSec, builder) {
 
 /**
  * Builds the compact GTFS schedule index from the official ZIP export.
+ *
+ * The municipal origin (193.23.225.211:8002) answers 403 to datacenter
+ * egress IPs — including every Cloudflare worker — so on production the
+ * direct fetch is attempted first (works in `wrangler dev` and from any
+ * residential network) and public relays of the SAME official URL are
+ * tried next. The resulting index is cached and served stale when every
+ * path fails, so one successful build keeps the board alive for days.
+ *
  * Index shape (kept compact on purpose — the raw feed is ~10 MB decompressed):
  *   stops:     [[stopId, name, lat, lon], ...]
  *   routes:    { routeId: {n: shortName, t: routeType, l: longName} }
@@ -363,15 +371,46 @@ async function cachedJson(key, ttlSec, builder) {
  *   calendar:  { serviceId: {s, e, d: "0111100"} } — d = mon..sun flags
  *   calDates:  { add: {date: [serviceId]}, rem: {date: [serviceId]} }
  */
-async function buildGtfsIndex() {
-  const res = await fetch(CONFIG.GTFS_STATIC_URL, {
-    headers: { "User-Agent": CONFIG.USER_AGENT },
-    cf: { cacheTtl: 600, cacheEverything: true }
-  });
-  if (!res.ok) throw new Error("GTFS static download failed: HTTP " + res.status);
+const GTFS_FETCH_VARIANTS = [
+  FETCH_VARIANTS[0], // direct
+  ...CONFIG.RELAY_URLS.map((relay, i) => ({
+    id: "relay" + (i + 1),
+    make: url => ({ url: relay + encodeURIComponent(url), headers: { "User-Agent": CONFIG.USER_AGENT } })
+  }))
+];
 
-  const buf = new Uint8Array(await res.arrayBuffer());
+const REALTIME_FETCH_VARIANTS = GTFS_FETCH_VARIANTS.map(v => ({
+  id: v.id,
+  make: v.make,
+  timeoutMs: v.id === "direct" ? 8000 : 12000
+}));
+
+/** Tries each fetch variant until one returns enough bytes; null when all fail. */
+async function fetchBytesWithFallback(url, variants, minBytes) {
+  for (const v of variants) {
+    try {
+      const opts = v.make(url);
+      const res = await fetch(opts.url, {
+        headers: opts.headers,
+        signal: AbortSignal.timeout(v.timeoutMs || 30000)
+      });
+      if (!res.ok) { console.error("fetch variant", v.id, "HTTP", res.status, url); continue; }
+      const buf = new Uint8Array(await res.arrayBuffer());
+      if (buf.length < minBytes) { console.error("fetch variant", v.id, "too small:", buf.length); continue; }
+      return { buf, variantId: v.id };
+    } catch (err) {
+      console.error("fetch variant", v.id, "failed:", (err && err.message) || err);
+    }
+  }
+  return null;
+}
+
+async function buildGtfsIndex() {
+  const fetched = await fetchBytesWithFallback(CONFIG.GTFS_STATIC_URL, GTFS_FETCH_VARIANTS, 200000);
+  if (!fetched) throw new Error("GTFS static unreachable from all fetch paths (origin 403s datacenter IPs; relays down)");
+  const buf = fetched.buf;
   const entries = readZipEntries(buf);
+  if (!entries["stops.txt"] || !entries["stop_times.txt"]) throw new Error("GTFS ZIP: required members missing via " + fetched.variantId);
 
   const [stopsTxt, routesTxt, tripsTxt, stopTimesTxt, calendarTxt, calDatesTxt, feedInfoTxt] = await Promise.all([
     readZipEntry(buf, entries["stops.txt"]),
@@ -431,19 +470,55 @@ async function buildGtfsIndex() {
 
 let gtfsMemo = null;
 
+const GTFS_CACHE_KEY = "https://kpt-cache.internal/gtfs-index-envelope-v4";
+
 /**
- * Loads the GTFS index: module memo → edge cache → fresh build.
- * Download/parse failures return null (the board degrades to an honest
- * "unavailable" message) instead of bubbling an exception into a 1101 page.
+ * Loads the GTFS index with serve-stale self-healing:
+ * module memo → edge cache (envelope with fetchedAt) → fresh build.
+ * A failed rebuild falls back to the previously cached index (stale flag),
+ * so a single successful build keeps the board alive across outages.
  */
 async function loadGtfsIndex(ctx = null, force = false) {
   if (!force && gtfsMemo) return gtfsMemo;
+
+  let envelope = null;
+  if (cacheStore) {
+    try {
+      const hit = await cacheStore.match(new Request(GTFS_CACHE_KEY));
+      if (hit) envelope = await hit.json();
+    } catch (_) {}
+  }
+
+  const FRESH_MS = CONFIG.GTFS_INDEX_TTL_SEC * 1000;
+  if (envelope && envelope.data && (Date.now() - envelope.fetchedAt) < FRESH_MS) {
+    gtfsMemo = envelope.data;
+    return gtfsMemo;
+  }
+
   try {
-    const index = await cachedJson("https://kpt-cache.internal/gtfs-index-v3", CONFIG.GTFS_INDEX_TTL_SEC, buildGtfsIndex);
-    if (index) gtfsMemo = index;
-    return index;
+    const data = await buildGtfsIndex();
+    data.fetchedAtMs = Date.now();
+    gtfsMemo = data;
+    if (cacheStore) {
+      try {
+        await cacheStore.put(new Request(GTFS_CACHE_KEY), new Response(JSON.stringify({
+          data, fetchedAt: Date.now()
+        }), {
+          headers: {
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": "public, max-age=" + 7 * 24 * 3600
+          }
+        }));
+      } catch (_) {}
+    }
+    return data;
   } catch (err) {
-    console.error("GTFS index load failed:", (err && err.message) || err);
+    console.error("GTFS index rebuild failed:", (err && err.message) || err);
+    if (envelope && envelope.data) {
+      envelope.data.stale = true;
+      gtfsMemo = envelope.data;
+      return gtfsMemo;
+    }
     return null;
   }
 }
@@ -493,19 +568,24 @@ async function loadMaynoStops(ctx = null) {
 
 let rtMemo = null, rtMemoUntil = 0;
 
-/** Live vehicles from the GTFS-RT feed (30s in-isolate memo). */
+/**
+ * Live vehicles from the GTFS-RT feed (30s in-isolate memo).
+ * The origin 403s datacenter IPs, so on the edge this relies on the
+ * relay fallbacks; on total failure the board degrades to
+ * schedule-only mode (honest, never crashes).
+ */
 async function loadRealtime(ctx = null) {
   const nowMs = Date.now();
   if (rtMemo && nowMs < rtMemoUntil) return rtMemo;
   try {
-    const res = await fetch(CONFIG.REALTIME_URL, { headers: { "User-Agent": CONFIG.USER_AGENT } });
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    const vehicles = parseRealtimeFeed(new Uint8Array(await res.arrayBuffer()));
+    const fetched = await fetchBytesWithFallback(CONFIG.REALTIME_URL, REALTIME_FETCH_VARIANTS, 20);
+    if (!fetched) throw new Error("realtime unreachable from all paths");
+    const vehicles = parseRealtimeFeed(fetched.buf);
     rtMemo = vehicles;
     rtMemoUntil = nowMs + CONFIG.REALTIME_TTL_SEC * 1000;
     return vehicles;
   } catch (_) {
-    rtMemo = []; // feed down → board degrades to schedule-only, never crashes
+    rtMemo = [];
     rtMemoUntil = nowMs + 10 * 1000;
     return rtMemo;
   }
