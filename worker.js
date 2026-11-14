@@ -152,25 +152,35 @@ function resolveDynamicVehicleFromTags(tags = {}, routeRef = "", tripIdx = 0) {
 
 /**
  * Dynamic API Query: Fetches live transit stops and passing routes dynamically for any stop in Kyiv.
+ *
+ * Uses a geographic bounding box for Kyiv city instead of unreliable area["admin_level"] filter.
+ * Kyiv bounding box (WGS84): south=50.213, west=30.239, north=50.590, east=30.825
+ *
+ * Query structure:
+ *   1. Find matching platform/stop_position nodes within Kyiv bbox → .stops
+ *   2. Traverse UP to parent route relations via `<` operator → route relations
+ *   3. Output all: nodes (with coords), relations (with members + tags)
  */
 async function fetchDynamicHubData(stopQuery) {
   const cleanStop = sanitizeQuery(stopQuery || CONFIG.DEFAULT_STOP);
 
-  // Overpass QL: Finds platforms/stops matching the query in Kyiv and pulls their parent route relations (<;)
+  // Kyiv city geographic bounding box — avoids OSM admin_level inconsistencies
+  const BBOX = "50.213,30.239,50.590,30.825";
+
   const ql = `
-    [out:json][timeout:10];
-    area["name"="Київ"]["admin_level"="4"]->.kyiv;
+    [out:json][timeout:15];
     (
-      node(area.kyiv)["public_transport"~"platform|stop_position"]["name"~"${cleanStop}",i];
-      way(area.kyiv)["public_transport"~"platform"]["name"~"${cleanStop}",i];
-      rel(area.kyiv)["public_transport"~"platform"]["name"~"${cleanStop}",i];
+      node["public_transport"~"platform|stop_position"]["name"~"${cleanStop}",i](${BBOX});
+      way["public_transport"~"platform"]["name"~"${cleanStop}",i](${BBOX});
     )->.stops;
-    .stops out body;
-    .stops <;
+    (
+      .stops;
+      .stops <;
+    );
     out body;
   `;
 
-  const elements = await executeOverpassQuery(ql, 10);
+  const elements = await executeOverpassQuery(ql, 15);
   return parseOverpassTransitElements(elements, cleanStop);
 }
 
@@ -178,7 +188,10 @@ async function fetchDynamicHubData(stopQuery) {
  * Parses raw Overpass API transit elements into structured platforms, routes, and itineraries.
  */
 function parseOverpassTransitElements(elements, rawQuery) {
-  if (!elements || elements.length === 0) return null;
+  // Return empty-directions structure (not null) so spatial fallback chain works correctly
+  if (!elements || elements.length === 0) {
+    return { title: "Київ, " + rawQuery, stopCoordinates: [], directions: [] };
+  }
 
   const nodeMap = new Map();
   const matchedStopNames = [];
@@ -325,24 +338,37 @@ async function resolveHubDepartures(query, ctx = null) {
   let parsed = await fetchDynamicHubData(normQuery);
 
   // 3. If direct name relation lookup was empty, query spatially around the stop's location
+  // Uses two-step approach: first get coords of matching stop, then find nearby stops + relations
   if (!parsed || parsed.directions.length === 0) {
-    const qlSpatial = `
-      [out:json][timeout:8];
-      area["name"="Київ"]["admin_level"="4"]->.kyiv;
-      (
-        node(area.kyiv)["public_transport"~"platform|stop_position"]["name"~"${sanitizeQuery(normQuery)}",i];
-        way(area.kyiv)["public_transport"~"platform"]["name"~"${sanitizeQuery(normQuery)}",i];
-      )->.point;
-      (
-        .point;
-        node(around.point:300)["public_transport"~"platform|stop_position"];
-      )->.allStops;
-      .allStops out body;
-      .allStops <;
-      out body;
+    const cleanQ = sanitizeQuery(normQuery);
+    const BBOX = "50.213,30.239,50.590,30.825";
+
+    // Step 1: get the coordinates of the named stop node
+    const qlCoords = `
+      [out:json][timeout:5];
+      node["public_transport"~"platform|stop_position"]["name"~"${cleanQ}",i](${BBOX});
+      out 1;
     `;
-    const spatialElements = await executeOverpassQuery(qlSpatial, 8);
-    parsed = parseOverpassTransitElements(spatialElements, normQuery);
+    const coordEls = await executeOverpassQuery(qlCoords, 5);
+    const anchor = coordEls.find(e => e.lat && e.lon);
+
+    if (anchor) {
+      // Step 2: find all stops within 300m of the anchor coords and traverse up to route relations
+      const qlSpatial = `
+        [out:json][timeout:10];
+        (
+          node["public_transport"~"platform|stop_position"](around:300,${anchor.lat},${anchor.lon});
+          way["public_transport"~"platform"](around:300,${anchor.lat},${anchor.lon});
+        )->.nearby;
+        (
+          .nearby;
+          .nearby <;
+        );
+        out body;
+      `;
+      const spatialElements = await executeOverpassQuery(qlSpatial, 10);
+      parsed = parseOverpassTransitElements(spatialElements, normQuery);
+    }
   }
 
   // 4. If no routes found in open transit API, return clear zero-state without mock routes
@@ -1085,10 +1111,11 @@ export default {
       let results = [];
 
       if (query.length >= 2) {
+        // Kyiv bbox — same approach as main query, avoids area["admin_level"] OSM inconsistencies
+        const BBOX = "50.213,30.239,50.590,30.825";
         const qlSearch = `
           [out:json][timeout:5];
-          area["name"="Київ"]["admin_level"="4"]->.kyiv;
-          node(area.kyiv)["public_transport"~"platform|stop_position"]["name"~"${query}",i];
+          node["public_transport"~"platform|stop_position"]["name"~"${query}",i](${BBOX});
           out tags 12;
         `;
         const elements = await executeOverpassQuery(qlSearch, 5);
