@@ -122,25 +122,29 @@ async function executeOverpassQuery(qlQuery, timeoutSec = 8) {
  * Zero hardcoded route-number branching or static model dictionaries.
  */
 function resolveDynamicVehicleFromTags(tags = {}, routeRef = "", tripIdx = 0) {
+  // FIX: seed uses only routeRef chars — tags.ref equals the route number (e.g. "М3"), NOT a board number
   const seed = (String(routeRef).split("").reduce((acc, c) => acc + c.charCodeAt(0), 0) + tripIdx * 43) % 8990;
-  const boardNum = tags.board || tags.ref || String(1020 + seed);
+
+  // FIX: removed tags.ref from board number chain — tags.ref is route reference, not vehicle board
+  const boardNum = tags.board || tags.board_number || String(1020 + seed);
   const plateLetters = ["BP", "KM", "KA", "AB", "CE", "HX"][tripIdx % 6];
-  const licensePlate = tags.license_plate || tags.reg_num || ("AA " + boardNum + " " + plateLetters);
 
-  // Purely dynamic extraction from API tags
+  // Board number must be numeric-looking for the license plate generation
+  const plateNum = String(boardNum).replace(/\D/g, "") || String(1020 + seed);
+  const licensePlate = tags.license_plate || tags.reg_num || ("AA " + plateNum + " " + plateLetters);
+
+  // Extract model purely from API tags — no hardcoded fallback strings with real operator names
   const rawModel = tags.model || tags.rolling_stock || tags.brand || tags.vehicle_model;
-  let modelStr = rawModel;
-  if (!modelStr) {
-    const operator = tags.operator || "КП «Київпастранс»";
-    const mode = tags.route || "Пасажирський транспорт";
-    modelStr = mode.toUpperCase() + " · " + operator;
-  }
 
-  const isAccessible = tags.wheelchair === "yes" || tags.low_floor === "yes" || tags.accessible !== "no";
+  // FIX: if no model tag present, show a neutral dash — never inject hardcoded "КП «Київпастранс»"
+  const modelStr = rawModel || "—";
+
+  // FIX: accessibility only true when explicitly tagged — missing tag ≠ accessible
+  const isAccessible = tags.wheelchair === "yes" || tags.low_floor === "yes";
 
   return {
     boardNumber: String(boardNum),
-    licensePlate: licensePlate,
+    licensePlate,
     model: modelStr,
     isLowFloor: isAccessible
   };
@@ -216,7 +220,10 @@ function parseOverpassTransitElements(elements, rawQuery) {
     else if (rawMode.includes("train") || rawMode.includes("railway")) modeType = "ПОЇЗД";
 
     const destination = tags.to || tags.destination || tags.headsign || (tags.from ? "до " + tags.from : "Кінцева зупинка");
-    const platKey = modeType + "_" + destination;
+
+    // FIX: group by modeType + routeRef + destination — prevents multiple different routes
+    // with the same destination string from collapsing into a single platform card
+    const platKey = modeType + "_" + routeRef + "_" + destination;
     const platTitle = "ПЛАТФОРМА · " + modeType + " (НАПРЯМОК: " + destination.toUpperCase() + ")";
 
     if (!platformGroups[platKey]) {
@@ -249,6 +256,11 @@ function parseOverpassTransitElements(elements, rawQuery) {
     const remainingStops = itinerary.slice(curIdx);
 
     const headways = modeType === "МЕТРО" ? [3, 7, 12] : (modeType === "ПОЇЗД" ? [16, 36] : [5, 14, 25]);
+
+    // FIX: deduplicate — if this platform group already has a departure with the same routeRef,
+    // skip adding duplicate trips (happens when the same route appears in multiple relation variants)
+    const alreadyHasRoute = platformGroups[platKey].departures.some(d => d.route === routeRef);
+    if (alreadyHasRoute) return;
 
     headways.forEach((offsetMin, tripIdx) => {
       const scheduledTime = formatTimeWithOffset(now, offsetMin);
@@ -382,7 +394,7 @@ function renderDirectionCardsHtml(hubData) {
       const tripId = "trip-" + dir.id + "-" + idx;
 
       // Strict municipal vehicle format: "№ 1524 | AA 1524 BP | Богдан А701.32 | ♿"
-      const veh = item.vehicle || { boardNumber: "1524", licensePlate: "AA 1524 BP", model: "Рухомий склад КП «Київпастранс»", isLowFloor: true };
+      const veh = item.vehicle || { boardNumber: "—", licensePlate: "—", model: "—", isLowFloor: false };
       const lowFloorTag = veh.isLowFloor ? ' | <span class="vehicle-accessibility" title="Низька підлога">♿</span>' : '';
       const vehicleInfoBarHtml = '<div class="vehicle-info-bar">' +
         '<span class="vehicle-board">№ ' + veh.boardNumber + '</span> | ' +
@@ -884,7 +896,7 @@ function renderFullPageHtml(hubData) {
         'const visible = isExp ? deps : deps.slice(0, 3);' +
         'const rows = visible.map((item, idx) => {' +
           'const tripId = "trip-" + dir.id + "-" + idx;' +
-          'const veh = item.vehicle || { boardNumber: "1524", licensePlate: "AA 1524 BP", model: "Рухомий склад КП «Київпастранс»", isLowFloor: true };' +
+          'const veh = item.vehicle || { boardNumber: "—", licensePlate: "—", model: "—", isLowFloor: false };' +
           'const lowFloorTag = veh.isLowFloor ? " | <span class=\\"vehicle-accessibility\\" title=\\"Низька підлога\\">♿</span>" : "";' +
           'const vehBar = "<div class=\\"vehicle-info-bar\\">" +' +
             '"<span class=\\"vehicle-board\\">№ " + veh.boardNumber + "</span> | " +' +
