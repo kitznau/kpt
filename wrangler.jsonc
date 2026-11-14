@@ -8,6 +8,10 @@
   "name": "kpt",
   "main": "worker.js",
   "compatibility_date": "2024-01-01",
+  "assets": {
+    "directory": "./assets",
+    "binding": "ASSETS"
+  },
   "triggers": {
     "crons": [
       "0 3 * * *"

@@ -470,16 +470,39 @@ async function buildGtfsIndex() {
 }
 
 let gtfsMemo = null;
+let lastBuildAttemptMs = 0;
+const BUILD_BACKOFF_MS = 5 * 60 * 1000; // after a failed remote rebuild, don't hammer relays for 5 min
 
 const GTFS_CACHE_KEY = "https://kpt-cache.internal/gtfs-index-envelope-v4";
 
+function indexLooksValid(data) {
+  return !!(data && Array.isArray(data.stops) && data.stops.length >= 100 && data.sched && data.trips && data.calendar);
+}
+
 /**
- * Loads the GTFS index with serve-stale self-healing:
- * module memo → edge cache (envelope with fetchedAt) → fresh build.
- * A failed rebuild falls back to the previously cached index (stale flag),
- * so a single successful build keeps the board alive across outages.
+ * Reads the bundled gtfs-index.json asset (available in every colo with
+ * zero network dependency). Returns the index or null.
  */
-async function loadGtfsIndex(ctx = null, force = false) {
+async function readAssetIndex(env) {
+  try {
+    if (!env || !env.ASSETS) return null;
+    const res = await env.ASSETS.fetch(new Request("https://assets.internal/gtfs-index.json"));
+    if (!res.ok) return null;
+    const data = await res.json();
+    return indexLooksValid(data) ? data : null;
+  } catch (err) {
+    console.error("asset index read failed:", (err && err.message) || err);
+    return null;
+  }
+}
+
+/**
+ * Loads the GTFS index with layered self-healing:
+ *   module memo → fresh edge-cache envelope → remote rebuild (direct + relays,
+ *   rate-limited) → stale envelope → bundled asset (always available, all colos).
+ * `fetchedAtMs` marks data age; a stale board still renders honestly.
+ */
+async function loadGtfsIndex(ctx = null, env = null, force = false) {
   if (!force && gtfsMemo) return gtfsMemo;
 
   let envelope = null;
@@ -491,37 +514,57 @@ async function loadGtfsIndex(ctx = null, force = false) {
   }
 
   const FRESH_MS = CONFIG.GTFS_INDEX_TTL_SEC * 1000;
-  if (envelope && envelope.data && (Date.now() - envelope.fetchedAt) < FRESH_MS) {
+  const isFresh = d => !!(d && d.fetchedAtMs && (Date.now() - d.fetchedAtMs) < FRESH_MS);
+
+  if (envelope && envelope.data && isFresh(envelope.data)) {
     gtfsMemo = envelope.data;
     return gtfsMemo;
   }
 
-  try {
-    const data = await buildGtfsIndex();
-    data.fetchedAtMs = Date.now();
-    gtfsMemo = data;
-    if (cacheStore) {
-      try {
-        await cacheStore.put(new Request(GTFS_CACHE_KEY), new Response(JSON.stringify({
-          data, fetchedAt: Date.now()
-        }), {
-          headers: {
-            "Content-Type": "application/json; charset=utf-8",
-            "Cache-Control": "public, max-age=" + 7 * 24 * 3600
-          }
-        }));
-      } catch (_) {}
-    }
-    return data;
-  } catch (err) {
-    console.error("GTFS index rebuild failed:", (err && err.message) || err);
-    if (envelope && envelope.data) {
-      envelope.data.stale = true;
-      gtfsMemo = envelope.data;
-      return gtfsMemo;
-    }
-    return null;
+  const assetIndex = await readAssetIndex(env);
+  if (assetIndex && isFresh(assetIndex)) {
+    gtfsMemo = assetIndex;
+    return gtfsMemo;
   }
+
+  // Remote rebuild — skipped during the backoff window after a failure,
+  // so cold requests never wait ~60 s of doomed relay timeouts.
+  if (Date.now() - lastBuildAttemptMs > BUILD_BACKOFF_MS) {
+    lastBuildAttemptMs = Date.now();
+    try {
+      const data = await buildGtfsIndex();
+      data.fetchedAtMs = Date.now();
+      gtfsMemo = data;
+      if (cacheStore) {
+        try {
+          await cacheStore.put(new Request(GTFS_CACHE_KEY), new Response(JSON.stringify({
+            data, fetchedAt: Date.now()
+          }), {
+            headers: {
+              "Content-Type": "application/json; charset=utf-8",
+              "Cache-Control": "public, max-age=" + 7 * 24 * 3600
+            }
+          }));
+        } catch (_) {}
+      }
+      return data;
+    } catch (err) {
+      console.error("GTFS index rebuild failed:", (err && err.message) || err);
+    }
+  }
+
+  // Stale fallbacks: previously fetched index, then the bundled asset.
+  if (envelope && envelope.data) {
+    envelope.data.stale = true;
+    gtfsMemo = envelope.data;
+    return gtfsMemo;
+  }
+  if (assetIndex) {
+    assetIndex.stale = true;
+    gtfsMemo = assetIndex;
+    return gtfsMemo;
+  }
+  return null;
 }
 
 /** Vehicle registry (open data): { "4-digit board no.": {model, lowFloor} } */
@@ -676,13 +719,13 @@ async function resolveTargetStops(index, query) {
   return null;
 }
 
-async function resolveHubDepartures(query, ctx = null) {
+async function resolveHubDepartures(query, ctx = null, env = null) {
   const hubKey = (query || CONFIG.DEFAULT_STOP).trim();
   const kyivTimeStr = kyivTimeString();
   const cacheKey = new Request("https://kpt-cache.internal/api/hub/v5/" + encodeURIComponent(normalizeName(hubKey)));
 
   async function buildHub() {
-      const index = await loadGtfsIndex(ctx);
+      const index = await loadGtfsIndex(ctx, env);
       if (!index) {
         return {
           hubKey: hubKey.toLowerCase().replace(/\s+/g, "-"),
@@ -838,21 +881,22 @@ async function resolveHubDepartures(query, ctx = null) {
  * SEARCH — official stop registry
  * ============================================================ */
 
-async function searchStops(query, ctx = null) {
-  const index = await loadGtfsIndex(ctx);
-  if (!index) return { results: [], unavailable: true };
-
+async function searchStops(query, ctx = null, env = null) {
+  const index = await loadGtfsIndex(ctx, env);
   const q = normalizeName(query);
   if (q.length < 2) return { results: [] };
 
-  // 1. GTFS control points (departures available)
   const byName = {};
-  for (const s of index.stops) {
-    const nameNorm = normalizeName(s[1]);
-    if (!nameNorm.includes(q)) continue;
-    const mode = STOP_MODE_LABELS[s[0].split("_")[0]] || "ТРАНЗ";
-    const entry = byName[s[1]] || (byName[s[1]] = { name: s[1], modeSet: new Set(), source: "gtfs" });
-    entry.modeSet.add(mode);
+
+  // 1. GTFS control points (departures available)
+  if (index) {
+    for (const s of index.stops) {
+      const nameNorm = normalizeName(s[1]);
+      if (!nameNorm.includes(q)) continue;
+      const mode = STOP_MODE_LABELS[s[0].split("_")[0]] || "ТРАНЗ";
+      const entry = byName[s[1]] || (byName[s[1]] = { name: s[1], modeSet: new Set(), source: "gtfs" });
+      entry.modeSet.add(mode);
+    }
   }
 
   // 2. Official registry (ІАС «Майно») — metro, funicular, city express and full street names
@@ -869,6 +913,8 @@ async function searchStops(query, ctx = null) {
     name: e.name,
     modes: [...e.modeSet].join(", ") || "Київ"
   }));
+
+  if (results.length === 0 && !index) return { results: [], unavailable: true };
 
   // Rank: prefix matches first, then alphabetical
   results.sort((a, b) => {
@@ -1581,7 +1627,7 @@ function typeKeyOf(typeLabel) {
 export default {
   // Cron: refresh the GTFS index nightly so the first morning request is instant
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(loadGtfsIndex(null, true).catch(() => {}));
+    ctx.waitUntil(loadGtfsIndex(null, env, true).catch(() => {}));
   },
 
   async fetch(request, env, ctx) {
@@ -1605,7 +1651,7 @@ export default {
       // 1. Root route: Server-Side Rendered HTML board
       if (pathname === "/" || pathname === "/index.html") {
         const stopQuery = searchParams.get("stop") || CONFIG.DEFAULT_STOP;
-        const hubData = await resolveHubDepartures(stopQuery, ctx);
+        const hubData = await resolveHubDepartures(stopQuery, ctx, env);
         const html = renderFullPageHtml(hubData);
         return new Response(html, {
           headers: { "Content-Type": "text/html; charset=utf-8" }
@@ -1615,13 +1661,13 @@ export default {
       // 2. Departure board API
       if (pathname === "/api/hub") {
         const stopQuery = searchParams.get("stop") || CONFIG.DEFAULT_STOP;
-        const hubData = await resolveHubDepartures(stopQuery, ctx);
+        const hubData = await resolveHubDepartures(stopQuery, ctx, env);
         return new Response(JSON.stringify(hubData), { headers: corsHeaders });
       }
 
       // 3. Stop search API over the official stop registry
       if (pathname === "/api/search") {
-        const data = await searchStops(searchParams.get("q") || "", ctx);
+        const data = await searchStops(searchParams.get("q") || "", ctx, env);
         return new Response(JSON.stringify(data), { headers: corsHeaders });
       }
 

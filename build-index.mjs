@@ -110,7 +110,7 @@ csvObjects(calDatesTxt).forEach(cd => { (calDates[cd.exception_type === "1" ? "a
 let version = "";
 csvObjects(feedInfoTxt).forEach(fi => version = fi.feed_version || version);
 
-const index = { version, stops, routes, trips, dest, sched, tripStops, calendar, calDates };
+const index = { version, stops, routes, trips, dest, sched, tripStops, calendar, calDates, fetchedAtMs: Date.now() };
 const json = JSON.stringify(index);
 const parseMs = (() => { const t = Date.now(); JSON.parse(json); return Date.now() - t; })();
 writeFileSync(OUT, json);
