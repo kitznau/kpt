@@ -1,414 +1,743 @@
 /**
  * Cloudflare Worker: Kyiv Public Transit Live Departure Monitor (KPT Abfahrtsmonitor)
- * 100% Pure Dynamic API Engine — Zero Hardcoded Dictionaries, Routes, or Model Branches
- * 
+ *
+ * DATA ENGINE: Official Kyiv City Open Data (Департамент транспортної інфраструктури КМДА)
+ * — overpass / OSM is no longer used.
+ *
  * Educational Architecture Overview:
- * 1. Pure Live Open Transit API Client:
- *    - All transit data (stations, platforms, passing routes, directions, and vehicle metadata)
- *      are queried on-demand over HTTPS Port 443.
- *    - No hardcoded route number conditions (e.g. no "if route is 114 or M3"), no static lists
- *      of stops, and no hardcoded fallback branches.
- * 2. Overpass Geospatial Transit Graph:
- *    - Queries platforms matching the user query within Kyiv administrative bounds.
- *    - Resolves passing routes dynamically via parent relation traversal (`<;`) and geospatial
- *      proximity search (`around:300`).
- * 3. Dynamic Vehicle Fleet Metadata:
- *    - Extracted purely from API attributes and tags (`model`, `rolling_stock`, `brand`, `operator`, `wheelchair`).
- *    - Conforms strictly to the municipal format: "№ {board} | {plate} | {model} | ♿".
+ * 1. GTFS Static (КП «Київпастранс», updated daily):
+ *    https://193.23.225.211:8002/export-gtfs-static (ZIP)
+ *    - stops.txt   → 1738 stops with names + coordinates (stop_id prefix: 1=tram, 2=trolleybus, 3=bus)
+ *    - routes.txt  → 192 routes (route_type: 0=tram, 11=trolleybus, 3=bus)
+ *    - trips.txt   → 27 424 trips (route, service day)
+ *    - stop_times  → 115 271 schedule rows → real departures per stop
+ *    Parsed on demand via DecompressionStream, cached at the edge (6h) and refreshed by cron.
+ * 2. GTFS Realtime vehicle feed (АСКДУ КП «Київпастранс»):
+ *    http://193.23.225.214:732/api/realtime (protobuf, refreshed every 30s)
+ *    - live vehicles: route id, board number, position → real fleet shown on the board.
+ * 3. Vehicle registry (open data, monthly):
+ *    - brand/model/low-floor/accessibility per vehicle, joined by board number digits.
  * 4. High-Performance Edge Caching (caches.default):
- *    - Caches API responses at Cloudflare Edge to guarantee sub-millisecond response times.
+ *    - GTFS index: 6h | vehicle registry: 24h | realtime: 30s | rendered hub: 60s.
  * 5. Interactive Transit Graph:
- *    - Live search directly queries matching stops from the open transit index.
- *    - Every stop in the route timeline is clickable (↗) and dynamically switches to that stop's board.
+ *    - Search queries the official stop registry; every timeline stop is clickable (↗).
  */
 
 const CONFIG = {
   TIMEZONE: "Europe/Kyiv",
-  EDGE_CACHE_TTL_SEC: 600, // 10 minutes cache TTL
   DEFAULT_STOP: "Позняки",
 
-  OVERPASS_ENDPOINTS: [
-    "https://overpass-api.de/api/interpreter",
-    "https://lz4.overpass-api.de/api/interpreter",
-    "https://overpass.kumi.systems/api/interpreter"
-  ]
+  GTFS_STATIC_URL: "http://193.23.225.211:8002/export-gtfs-static",
+  REALTIME_URL: "http://193.23.225.214:732/api/realtime",
+  VEHICLES_URL:
+    "https://data.kyivcity.gov.ua/dataset/vidomosti-pro-transportni-zasoby-iaki-obsluhovuiut-pasazhyrski-avtobusni-troleibusni-t-dep-transport/resource/efad1f37-779d-4d8e-9d1e-3a6b345775d6/data/download",
+  MAYNO_STOPS_URL:
+    "https://data.kyivcity.gov.ua/dataset/dani-pro-mistse-rozmishchennia-zupynok-miskoho-elektrychnoho-ta-avtomobilnoho-transpor-dep-transport/resource/269ffb2e-dac0-4978-9552-10d29a30724b/data/download",
+
+  GTFS_INDEX_TTL_SEC: 6 * 3600,   // schedule is refreshed daily by the city — 6h edge cache
+  VEHICLES_TTL_SEC: 24 * 3600,    // vehicle registry updates monthly
+  MAYNO_TTL_SEC: 24 * 3600,       // official stop registry (ІАС «Майно»)
+  REALTIME_TTL_SEC: 30,           // GTFS-RT feed refresh
+  HUB_TTL_SEC: 60,                // rendered departure board
+
+  NEARBY_STOP_RADIUS_M: 250,      // Mayno point → nearby GTFS control points
+
+  MAX_DEPARTURES_PER_CARD: 10,
+  TIMELINE_STOPS_LIMIT: 8,
+
+  USER_AGENT: "KPT-Departure-Monitor/3.0 (Kyiv City Open Data Engine)"
 };
 
-/**
- * Returns current timestamp adjusted specifically to Europe/Kyiv timezone.
- */
-function getKyivNow() {
-  return new Date(new Date().toLocaleString("en-US", { timeZone: CONFIG.TIMEZONE }));
+/* ============================================================
+ * TIME HELPERS (Europe/Kyiv — computed arithmetically)
+ * IMPORTANT: workerd's ICU may not resolve the "Europe/Kyiv" timeZone
+ * (modern spelling; older data has "Europe/Kiev") and silently falls
+ * back to UTC. Never use toLocaleString for Kyiv conversion here —
+ * compute EET (UTC+2) / EEST (UTC+3) manually instead.
+ * ============================================================ */
+
+/** Last Sunday of a month (monthIdx 0-based) as a UTC Date at 00:00 UTC. */
+function lastSundayOf(y, monthIdx) {
+  const last = new Date(Date.UTC(y, monthIdx + 1, 0)); // last day of that month
+  return new Date(Date.UTC(y, monthIdx + 1, 0 - last.getUTCDay()));
 }
 
-/**
- * Formats a Date object to HH:MM format.
- */
-function formatTimeHM(date) {
-  return String(date.getHours()).padStart(2, "0") + ":" + String(date.getMinutes()).padStart(2, "0");
+/** Kyiv offset vs UTC in seconds: EEST (UTC+3) from last Sun of Mar 01:00 UTC
+ *  to last Sun of Oct 01:00 UTC, otherwise EET (UTC+2). */
+function getKyivOffsetSec(d) {
+  const y = d.getUTCFullYear();
+  const start = lastSundayOf(y, 2); start.setUTCHours(1, 0, 0, 0);
+  const end = lastSundayOf(y, 9); end.setUTCHours(1, 0, 0, 0);
+  return (d >= start && d < end) ? 3 * 3600 : 2 * 3600;
 }
 
-/**
- * Formats time with added minute offset.
- */
-function formatTimeWithOffset(baseDate, offsetMinutes) {
-  const d = new Date(baseDate.getTime() + Math.round(offsetMinutes) * 60000);
-  return formatTimeHM(d);
-}
-
-/**
- * Formats countdown minutes into digital display format.
- */
-function formatMinutes(minutes) {
-  if (minutes <= 0) return "<span class='eta-cell' style='color:#3fb950'>0'</span>";
-  if (minutes >= 60) {
-    const hrs = Math.floor(minutes / 60);
-    const mins = minutes % 60;
-    return "<span class='eta-cell hours'>" + hrs + "h " + mins + "'</span>";
-  }
-  return "<span class='eta-cell'>" + minutes + "'</span>";
-}
-
-/**
- * Sanitizes input string for safe usage in Overpass QL regex queries.
- */
-function sanitizeQuery(str) {
-  return (str || "")
-    .replace(/[«»"'„“]/g, "")
-    .replace(/[.*+?^${}()|[\]\\]/g, "")
-    .trim();
-}
-
-/**
- * Executes an Overpass QL query across active endpoints with automatic mirror failover.
- */
-async function executeOverpassQuery(qlQuery, timeoutSec = 8) {
-  const encodedData = "data=" + encodeURIComponent(qlQuery);
-
-  for (const endpoint of CONFIG.OVERPASS_ENDPOINTS) {
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutSec * 1000);
-
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-          "Accept": "application/json",
-          "User-Agent": "KPT-Departure-Monitor/2.0 (Kyiv Open Transit Engine)"
-        },
-        body: encodedData,
-        signal: controller.signal
-      });
-
-      clearTimeout(timer);
-
-      if (res.ok) {
-        const json = await res.json();
-        if (json && Array.isArray(json.elements)) {
-          return json.elements;
-        }
-      }
-    } catch (_) {
-      // Failover to next mirror endpoint
-    }
-  }
-
-  return [];
-}
-
-/**
- * Dynamically resolves vehicle metadata purely from API tags and metadata.
- * Zero hardcoded route-number branching or static model dictionaries.
- */
-function resolveDynamicVehicleFromTags(tags = {}, routeRef = "", tripIdx = 0) {
-  // FIX: seed uses only routeRef chars — tags.ref equals the route number (e.g. "М3"), NOT a board number
-  const seed = (String(routeRef).split("").reduce((acc, c) => acc + c.charCodeAt(0), 0) + tripIdx * 43) % 8990;
-
-  // FIX: removed tags.ref from board number chain — tags.ref is route reference, not vehicle board
-  const boardNum = tags.board || tags.board_number || String(1020 + seed);
-  const plateLetters = ["BP", "KM", "KA", "AB", "CE", "HX"][tripIdx % 6];
-
-  // Board number must be numeric-looking for the license plate generation
-  const plateNum = String(boardNum).replace(/\D/g, "") || String(1020 + seed);
-  const licensePlate = tags.license_plate || tags.reg_num || ("AA " + plateNum + " " + plateLetters);
-
-  // Extract model purely from API tags — no hardcoded fallback strings with real operator names
-  const rawModel = tags.model || tags.rolling_stock || tags.brand || tags.vehicle_model;
-
-  // FIX: if no model tag present, show a neutral dash — never inject hardcoded "КП «Київпастранс»"
-  const modelStr = rawModel || "—";
-
-  // FIX: accessibility only true when explicitly tagged — missing tag ≠ accessible
-  const isAccessible = tags.wheelchair === "yes" || tags.low_floor === "yes";
-
+/** Current Kyiv wall-clock parts (optionally shifted by N days for service days). */
+function kyivParts(offsetDays = 0) {
+  const now = new Date();
+  const shifted = new Date(now.getTime() + (getKyivOffsetSec(now) + offsetDays * 86400) * 1000);
   return {
-    boardNumber: String(boardNum),
-    licensePlate,
-    model: modelStr,
-    isLowFloor: isAccessible
+    hours: shifted.getUTCHours(),
+    minutes: shifted.getUTCMinutes(),
+    seconds: shifted.getUTCSeconds(),
+    dateStr: shifted.getUTCFullYear() + String(shifted.getUTCMonth() + 1).padStart(2, "0") + String(shifted.getUTCDate()).padStart(2, "0"),
+    dayIdx: shifted.getUTCDay()
   };
 }
 
-/**
- * Dynamic API Query: Fetches live transit stops and passing routes dynamically for any stop in Kyiv.
- *
- * Uses a geographic bounding box for Kyiv city instead of unreliable area["admin_level"] filter.
- * Kyiv bounding box (WGS84): south=50.213, west=30.239, north=50.590, east=30.825
- *
- * Query structure:
- *   1. Find matching platform/stop_position nodes within Kyiv bbox → .stops
- *   2. Traverse UP to parent route relations via `<` operator → route relations
- *   3. Output all: nodes (with coords), relations (with members + tags)
- */
-async function fetchDynamicHubData(stopQuery) {
-  const cleanStop = sanitizeQuery(stopQuery || CONFIG.DEFAULT_STOP);
+function kyivTimeString() {
+  const p = kyivParts();
+  return String(p.hours).padStart(2, "0") + ":" + String(p.minutes).padStart(2, "0");
+}
 
-  // Kyiv city geographic bounding box — avoids OSM admin_level inconsistencies
-  const BBOX = "50.213,30.239,50.590,30.825";
+function getKyivSecondsOfDay() {
+  const p = kyivParts();
+  return p.hours * 3600 + p.minutes * 60 + p.seconds;
+}
 
-  const ql = `
-    [out:json][timeout:15];
-    (
-      node["public_transport"~"platform|stop_position"]["name"~"${cleanStop}",i](${BBOX});
-      way["public_transport"~"platform"]["name"~"${cleanStop}",i](${BBOX});
-    )->.stops;
-    (
-      .stops;
-      .stops <;
-    );
-    out body;
-  `;
+/** Returns {dateStr: "YYYYMMDD", dayIdx: 0..6 (sunday=0)} for the current Kyiv service day. */
+function getKyivServiceDay(offsetDays = 0) {
+  const p = kyivParts(offsetDays);
+  return { dateStr: p.dateStr, dayIdx: p.dayIdx };
+}
 
-  const elements = await executeOverpassQuery(ql, 15);
-  return parseOverpassTransitElements(elements, cleanStop);
+/** Formats seconds-after-midnight (may exceed 24h) into HH:MM (24h wrap). */
+function formatGtfsTime(sec) {
+  const h = Math.floor(sec / 3600) % 24;
+  const m = Math.floor((sec % 3600) / 60);
+  return String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0");
+}
+
+/* ============================================================
+ * ZIP + CSV + PROTOBUF PARSING (validated against real feeds)
+ * ============================================================ */
+
+function readZipEntries(buf) {
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= Math.max(0, buf.length - 65558); i--) {
+    if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error("ZIP: EOCD not found");
+  const count = dv.getUint16(eocd + 10, true);
+  let off = dv.getUint32(eocd + 16, true);
+
+  const files = {};
+  for (let n = 0; n < count; n++) {
+    if (dv.getUint32(off, true) !== 0x02014b50) break;
+    const method = dv.getUint16(off + 10, true);
+    const csize = dv.getUint32(off + 20, true);
+    const nameLen = dv.getUint16(off + 28, true);
+    const extraLen = dv.getUint16(off + 30, true);
+    const commentLen = dv.getUint16(off + 32, true);
+    const lho = dv.getUint32(off + 42, true);
+    const name = new TextDecoder().decode(buf.subarray(off + 46, off + 46 + nameLen));
+    const lnLen = dv.getUint16(lho + 26, true);
+    const lExLen = dv.getUint16(lho + 28, true);
+    files[name] = { method, csize, dataStart: lho + 30 + lnLen + lExLen };
+    off += 46 + nameLen + extraLen + commentLen;
+  }
+  return files;
+}
+
+async function inflateRaw(u8) {
+  const ds = new DecompressionStream("deflate-raw");
+  const stream = new Blob([u8]).stream().pipeThrough(ds);
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+async function readZipEntry(buf, entry) {
+  const slice = buf.subarray(entry.dataStart, entry.dataStart + entry.csize);
+  if (entry.method === 0) return new TextDecoder().decode(slice);
+  if (entry.method === 8) return new TextDecoder().decode(await inflateRaw(slice));
+  throw new Error("ZIP: unsupported compression method " + entry.method);
+}
+
+/** RFC-4180-ish CSV parser (handles quoted fields with embedded commas/quotes). */
+function csvObjects(text) {
+  const rows = [];
+  let i = 0, field = "", row = [], inQ = false;
+  while (i < text.length) {
+    const c = text[i];
+    if (inQ) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i += 2; continue; }
+        inQ = false; i++; continue;
+      }
+      field += c; i++; continue;
+    }
+    if (c === '"') { inQ = true; i++; continue; }
+    if (c === ",") { row.push(field); field = ""; i++; continue; }
+    if (c === "\n") { row.push(field); field = ""; rows.push(row); row = []; i++; continue; }
+    if (c === "\r") { i++; continue; }
+    field += c; i++;
+  }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  if (rows.length === 0) return [];
+  const head = rows[0].map(h => h.trim());
+  return rows.slice(1)
+    .filter(r => r.length >= head.length && r.some(c => c !== ""))
+    .map(r => {
+      const o = {};
+      head.forEach((h, idx) => o[h] = (r[idx] || "").trim());
+      return o;
+    });
+}
+
+/** Generic protobuf walker: calls cb(fieldNumber, wireType, value) for every field. */
+function pbWalk(u8, cb) {
+  const td = new TextDecoder();
+  let i = 0;
+  while (i < u8.length) {
+    let key = 0, shift = 0, b;
+    do { b = u8[i++]; key |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
+    const field = key >>> 3, wire = key & 7;
+    if (wire === 0) {
+      let v = 0, sh = 0;
+      do { b = u8[i++]; v |= (b & 0x7f) << sh; sh += 7; } while (b & 0x80);
+      cb(field, "varint", v);
+    } else if (wire === 1) {
+      cb(field, "fixed64", u8.subarray(i, i + 8)); i += 8;
+    } else if (wire === 2) {
+      let v = 0, sh = 0;
+      do { b = u8[i++]; v |= (b & 0x7f) << sh; sh += 7; } while (b & 0x80);
+      cb(field, "bytes", u8.subarray(i, i + v)); i += v;
+    } else if (wire === 5) {
+      cb(field, "fixed32", u8.subarray(i, i + 4)); i += 4;
+    } else {
+      break; // unknown wire type — stop walking this message
+    }
+  }
+}
+
+function pbF32(u8) {
+  return new DataView(u8.buffer, u8.byteOffset, u8.byteLength).getFloat32(0, true);
+}
+
+/** Parses the Kyiv GTFS-RT VehiclePosition feed (protobuf) into plain vehicle objects. */
+function parseRealtimeFeed(u8) {
+  const td = new TextDecoder();
+  const vehicles = [];
+  pbWalk(u8, (f, t, v) => {
+    if (f !== 2 || t !== "bytes") return; // FeedMessage.entity
+    pbWalk(v, (f2, t2, v2) => {
+      if (f2 !== 4 || t2 !== "bytes") return; // FeedEntity.vehicle (VehiclePosition)
+      const veh = {};
+      pbWalk(v2, (f3, t3, v3) => {
+        if (f3 === 1 && t3 === "bytes") { // TripDescriptor
+          pbWalk(v3, (f4, t4, v4) => {
+            if (f4 === 1 && t4 === "bytes") veh.tripId = td.decode(v4);
+            if (f4 === 5 && t4 === "bytes") veh.routeId = td.decode(v4);
+            if (f4 === 6 && t4 === "varint") veh.directionId = v4;
+          });
+        } else if (f3 === 2 && t3 === "bytes") { // Position
+          pbWalk(v3, (f4, t4, v4) => {
+            if (f4 === 1 && t4 === "fixed32") veh.lat = pbF32(v4);
+            if (f4 === 2 && t4 === "fixed32") veh.lon = pbF32(v4);
+            if (f4 === 3 && t4 === "fixed32") veh.bearing = pbF32(v4);
+            if (f4 === 4 && t4 === "fixed32") veh.speed = pbF32(v4);
+          });
+        } else if (f3 === 5 && t3 === "varint") {
+          veh.timestamp = v3;
+        } else if (f3 === 8 && t3 === "bytes") { // VehicleDescriptor
+          pbWalk(v3, (f4, t4, v4) => {
+            if (f4 === 1 && t4 === "bytes") veh.vehicleId = td.decode(v4);
+            if (f4 === 2 && t4 === "bytes") veh.label = td.decode(v4);
+            if (f4 === 3 && t4 === "bytes") veh.licensePlate = td.decode(v4);
+          });
+        }
+      });
+      if (veh.routeId || veh.lat !== undefined) vehicles.push(veh);
+    });
+  });
+  return vehicles;
+}
+
+/* ============================================================
+ * EDGE-CACHED DATA LOADERS
+ * ============================================================ */
+
+const cacheStore = (typeof caches !== "undefined") ? caches.default : null;
+
+async function cachedJson(key, ttlSec, builder) {
+  const cacheKey = new Request(key);
+  if (cacheStore) {
+    try {
+      const hit = await cacheStore.match(cacheKey);
+      if (hit) return await hit.json();
+    } catch (_) {}
+  }
+  const data = await builder();
+  if (cacheStore && data) {
+    try {
+      await cacheStore.put(cacheKey, new Response(JSON.stringify(data), {
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "Cache-Control": "public, max-age=" + ttlSec
+        }
+      }));
+    } catch (_) {}
+  }
+  return data;
 }
 
 /**
- * Parses raw Overpass API transit elements into structured platforms, routes, and itineraries.
+ * Builds the compact GTFS schedule index from the official ZIP export.
+ * Index shape (kept compact on purpose — the raw feed is ~10 MB decompressed):
+ *   stops:     [[stopId, name, lat, lon], ...]
+ *   routes:    { routeId: {n: shortName, t: routeType, l: longName} }
+ *   trips:     { tripId: {r: routeId, s: serviceId} }
+ *   dest:      { tripId: lastStopId }               — trip destination
+ *   sched:     { stopId: [[depSec, tripId], ...] }  — all departures per stop
+ *   tripStops: { tripId: [[stopId, depSec], ...] }  — ordered stop sequence per trip
+ *   calendar:  { serviceId: {s, e, d: "0111100"} } — d = mon..sun flags
+ *   calDates:  { add: {date: [serviceId]}, rem: {date: [serviceId]} }
  */
-function parseOverpassTransitElements(elements, rawQuery) {
-  // Return empty-directions structure (not null) so spatial fallback chain works correctly
-  if (!elements || elements.length === 0) {
-    return { title: "Київ, " + rawQuery, stopCoordinates: [], directions: [] };
-  }
+async function buildGtfsIndex() {
+  const res = await fetch(CONFIG.GTFS_STATIC_URL, {
+    headers: { "User-Agent": CONFIG.USER_AGENT },
+    cf: { cacheTtl: 600, cacheEverything: true }
+  });
+  if (!res.ok) throw new Error("GTFS static download failed: HTTP " + res.status);
 
-  const nodeMap = new Map();
-  const matchedStopNames = [];
-  const routeRelations = [];
-  const stopCoordinates = [];
+  const buf = new Uint8Array(await res.arrayBuffer());
+  const entries = readZipEntries(buf);
 
-  elements.forEach(el => {
-    if (el.type === "node" || el.type === "way") {
-      const name = el.tags && el.tags.name;
-      if (name) {
-        nodeMap.set(el.id, name);
-        if (name.toLowerCase().includes(rawQuery.toLowerCase())) {
-          matchedStopNames.push(name);
-        }
-      }
-      if (el.lat && el.lon) {
-        stopCoordinates.push({ lat: el.lat, lon: el.lon });
-      }
-    } else if (el.type === "relation" && el.tags && (el.tags.type === "route" || el.tags.route)) {
-      routeRelations.push(el);
-    }
+  const [stopsTxt, routesTxt, tripsTxt, stopTimesTxt, calendarTxt, calDatesTxt, feedInfoTxt] = await Promise.all([
+    readZipEntry(buf, entries["stops.txt"]),
+    readZipEntry(buf, entries["routes.txt"]),
+    readZipEntry(buf, entries["trips.txt"]),
+    readZipEntry(buf, entries["stop_times.txt"]),
+    readZipEntry(buf, entries["calendar.txt"]),
+    entries["calendar_dates.txt"] ? readZipEntry(buf, entries["calendar_dates.txt"]) : Promise.resolve(""),
+    entries["feed_info.txt"] ? readZipEntry(buf, entries["feed_info.txt"]) : Promise.resolve("")
+  ]);
+
+  const stops = csvObjects(stopsTxt).map(s => [s.stop_id, s.stop_name, parseFloat(s.stop_lat), parseFloat(s.stop_lon)]);
+  const routes = {};
+  csvObjects(routesTxt).forEach(r => {
+    routes[r.route_id] = { n: r.route_short_name || r.route_id, t: parseInt(r.route_type, 10) || 0, l: r.route_long_name || "" };
   });
 
-  const canonicalName = matchedStopNames.length > 0 ? matchedStopNames[0] : ("Київ, " + rawQuery);
-  const now = getKyivNow();
+  const trips = {};
+  csvObjects(tripsTxt).forEach(t => {
+    trips[t.trip_id] = { r: t.route_id, s: t.service_id };
+  });
 
-  // Group passing routes into platforms / directions dynamically
-  const platformGroups = {};
+  const dest = {};
+  const sched = {};
+  const tripStops = {};
+  csvObjects(stopTimesTxt).forEach(st => {
+    const parts = st.departure_time.split(":").map(Number);
+    if (parts.length !== 3 || Number.isNaN(parts[0])) return;
+    const dep = parts[0] * 3600 + parts[1] * 60 + parts[2];
+    if (!sched[st.stop_id]) sched[st.stop_id] = [];
+    sched[st.stop_id].push([dep, st.trip_id]);
+    if (!tripStops[st.trip_id]) tripStops[st.trip_id] = [];
+    tripStops[st.trip_id].push([st.stop_id, dep]);
+    dest[st.trip_id] = st.stop_id; // rows come in stop_sequence order — last wins
+  });
 
-  routeRelations.forEach(rel => {
-    const tags = rel.tags || {};
-    const routeRef = tags.ref || tags.name || tags.route_name || "Маршрут";
-    const rawMode = (tags.route || "bus").toLowerCase();
+  const calendar = {};
+  csvObjects(calendarTxt).forEach(c => {
+    calendar[c.service_id] = {
+      s: c.start_date,
+      e: c.end_date,
+      d: [c.monday, c.tuesday, c.wednesday, c.thursday, c.friday, c.saturday, c.sunday].map(x => x === "1" ? "1" : "0").join("")
+    };
+  });
 
-    let modeType = "АВТ";
-    if (rawMode.includes("subway") || rawMode.includes("metro")) modeType = "МЕТРО";
-    else if (rawMode.includes("tram")) modeType = "ТРАМ";
-    else if (rawMode.includes("trolley")) modeType = "ТРОЛ";
-    else if (rawMode.includes("train") || rawMode.includes("railway")) modeType = "ПОЇЗД";
+  const calDates = { add: {}, rem: {} };
+  csvObjects(calDatesTxt).forEach(cd => {
+    const bucket = cd.exception_type === "1" ? calDates.add : calDates.rem;
+    (bucket[cd.date] ||= []).push(cd.service_id);
+  });
 
-    const destination = tags.to || tags.destination || tags.headsign || (tags.from ? "до " + tags.from : "Кінцева зупинка");
+  let version = "";
+  csvObjects(feedInfoTxt).forEach(fi => version = fi.feed_version || version);
 
-    // FIX: group by modeType + routeRef + destination — prevents multiple different routes
-    // with the same destination string from collapsing into a single platform card
-    const platKey = modeType + "_" + routeRef + "_" + destination;
-    const platTitle = "ПЛАТФОРМА · " + modeType + " (НАПРЯМОК: " + destination.toUpperCase() + ")";
+  return { version, stops, routes, trips, dest, sched, tripStops, calendar, calDates };
+}
 
-    if (!platformGroups[platKey]) {
-      platformGroups[platKey] = {
-        id: "plat-" + Object.keys(platformGroups).length,
-        title: platTitle,
-        type: modeType,
-        departures: []
+let gtfsMemo = null;
+
+/** Loads the GTFS index: module memo → edge cache → fresh build. */
+async function loadGtfsIndex(ctx = null, force = false) {
+  if (!force && gtfsMemo) return gtfsMemo;
+  const index = await cachedJson("https://kpt-cache.internal/gtfs-index-v3", CONFIG.GTFS_INDEX_TTL_SEC, buildGtfsIndex);
+  if (index) gtfsMemo = index;
+  return index;
+}
+
+/** Vehicle registry (open data): { "4-digit board no.": {model, lowFloor} } */
+async function buildVehicleIndex() {
+  const res = await fetch(CONFIG.VEHICLES_URL, { headers: { "User-Agent": CONFIG.USER_AGENT } });
+  if (!res.ok) throw new Error("Vehicle registry download failed: HTTP " + res.status);
+  const list = await res.json();
+  const map = {};
+  if (Array.isArray(list)) {
+    list.forEach(v => {
+      const digits = String(v.vehicleNumber || "").match(/\d{3,}/);
+      if (digits) {
+        map[digits[0]] = {
+          model: [v.brand, v.model].filter(Boolean).join(" ") || "—",
+          lowFloor: String(v.isLowFloor) === "True" || v.wheelchairAccessible === 1
+        };
+      }
+    });
+  }
+  return map;
+}
+
+async function loadVehicleIndex(ctx = null) {
+  return cachedJson("https://kpt-cache.internal/vehicle-registry", CONFIG.VEHICLES_TTL_SEC, buildVehicleIndex);
+}
+
+/**
+ * Official stop registry (ІАС «Майно», includes metro, funicular and city express points
+ * that are missing from the Kyivpastrans GTFS control points).
+ * Shape: [[label, lat, lon], ...]
+ */
+async function buildMaynoStops() {
+  const res = await fetch(CONFIG.MAYNO_STOPS_URL, { headers: { "User-Agent": CONFIG.USER_AGENT } });
+  if (!res.ok) throw new Error("Mayno stop registry download failed: HTTP " + res.status);
+  const list = await res.json();
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter(s => s && s.label && typeof s.lat === "number" && typeof s.lon === "number")
+    .map(s => [s.label, s.lat, s.lon]);
+}
+
+async function loadMaynoStops(ctx = null) {
+  return cachedJson("https://kpt-cache.internal/mayno-stops", CONFIG.MAYNO_TTL_SEC, buildMaynoStops);
+}
+
+let rtMemo = null, rtMemoUntil = 0;
+
+/** Live vehicles from the GTFS-RT feed (30s in-isolate memo). */
+async function loadRealtime(ctx = null) {
+  const nowMs = Date.now();
+  if (rtMemo && nowMs < rtMemoUntil) return rtMemo;
+  try {
+    const res = await fetch(CONFIG.REALTIME_URL, { headers: { "User-Agent": CONFIG.USER_AGENT } });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const vehicles = parseRealtimeFeed(new Uint8Array(await res.arrayBuffer()));
+    rtMemo = vehicles;
+    rtMemoUntil = nowMs + CONFIG.REALTIME_TTL_SEC * 1000;
+    return vehicles;
+  } catch (_) {
+    rtMemo = []; // feed down → board degrades to schedule-only, never crashes
+    rtMemoUntil = nowMs + 10 * 1000;
+    return rtMemo;
+  }
+}
+
+/** Active GTFS service ids for the current Kyiv service day (calendar + exceptions). */
+function activeServiceIds(index) {
+  const today = getKyivServiceDay();
+  const set = new Set();
+  Object.entries(index.calendar).forEach(([sid, c]) => {
+    if (today.dateStr >= c.s && today.dateStr <= c.e && c.d[today.dayIdx] === "1") set.add(sid);
+  });
+  const add = index.calDates.add[today.dateStr];
+  if (add) add.forEach(sid => set.add(sid));
+  const rem = index.calDates.rem[today.dateStr];
+  if (rem) rem.forEach(sid => set.delete(sid));
+  return set;
+}
+
+const ROUTE_TYPE_LABELS = { 0: "ТРАМ", 11: "ТРОЛ", 3: "АВТ", 1: "МЕТРО", 2: "ПОЇЗД" };
+const ROUTE_TYPE_CLASSES = { 0: "tram", 11: "trolley", 3: "bus", 1: "metro", 2: "train" };
+const STOP_MODE_LABELS = { "1": "ТРАМ", "2": "ТРОЛ", "3": "АВТ" };
+
+/* ============================================================
+ * HUB RESOLVER — official schedule board for any stop
+ * ============================================================ */
+
+function normalizeName(str) {
+  return String(str || "").toLowerCase().replace(/[«»"'„“]/g, "").replace(/\s+/g, " ").trim();
+}
+
+function distanceMeters(lat1, lon1, lat2, lon2) {
+  const dLat = (lat2 - lat1) * 111320;
+  const dLon = (lon2 - lon1) * 111320 * Math.cos((lat1 + lat2) / 2 * Math.PI / 180);
+  return Math.hypot(dLat, dLon);
+}
+
+/**
+ * Resolves a free-text query into a hub target:
+ * 1. exact/substring name match in the GTFS control points (all stops with that name),
+ * 2. otherwise — official registry (ІАС «Майно») point → all GTFS stops within 250 m,
+ *    so a metro vestibule or "вул. Хрещатик" resolves to the real nearby platforms.
+ * Returns { title, stopIds } or null.
+ */
+async function resolveTargetStops(index, query) {
+  const q = normalizeName(query);
+  if (!q) return null;
+
+  // 1. GTFS name match — group stops by exact name, pick the busiest name
+  const exactNames = {};
+  const allNames = {};
+  for (const s of index.stops) {
+    const nameNorm = normalizeName(s[1]);
+    if (nameNorm === q) (exactNames[s[1]] ||= []).push(s);
+    if (nameNorm.includes(q)) (allNames[s[1]] ||= []).push(s);
+  }
+
+  const pickBusiest = pool => {
+    let best = null, bestScore = -1;
+    for (const [name, stops] of Object.entries(pool)) {
+      const score = stops.reduce((acc, s) => acc + (index.sched[s[0]] || []).length, 0);
+      if (score > bestScore) { bestScore = score; best = { title: name, stopIds: stops.map(s => s[0]) }; }
+    }
+    return best;
+  };
+
+  const exact = pickBusiest(exactNames);
+  if (exact) return exact;
+  const partial = pickBusiest(allNames);
+  if (partial) return partial;
+
+  // 2. Mayno registry match → nearby GTFS control points (two-step radius:
+  //    tight 250 m first; Khreshchatyk-type pedestrian zones need the 500 m fallback)
+  const mayno = await loadMaynoStops().catch(() => []);
+  const maynoMatch = mayno.find(m => normalizeName(m[0]) === q)
+    || mayno.find(m => normalizeName(m[0]).includes(q));
+  if (maynoMatch) {
+    for (const radius of [250, 500]) {
+      const nearby = index.stops
+        .filter(s => s[2] && s[3] && distanceMeters(maynoMatch[1], maynoMatch[2], s[2], s[3]) <= radius);
+      if (nearby.length > 0) {
+        return { title: maynoMatch[0], stopIds: nearby.map(s => s[0]) };
+      }
+    }
+  }
+
+  return null;
+}
+
+async function resolveHubDepartures(query, ctx = null) {
+  const hubKey = (query || CONFIG.DEFAULT_STOP).trim();
+  const kyivTimeStr = kyivTimeString();
+  const cacheKey = new Request("https://kpt-cache.internal/api/hub/v5/" + encodeURIComponent(normalizeName(hubKey)));
+
+  async function buildHub() {
+      const index = await loadGtfsIndex(ctx);
+      if (!index) {
+        return {
+          hubKey: hubKey.toLowerCase().replace(/\s+/g, "-"),
+          title: "Київ, " + hubKey,
+          kyivTime: kyivTimeStr,
+          directions: [],
+          unavailable: true
+        };
+      }
+
+      const target = await resolveTargetStops(index, hubKey || CONFIG.DEFAULT_STOP);
+      if (!target) {
+        return {
+          hubKey: hubKey.toLowerCase().replace(/\s+/g, "-"),
+          title: "Київ, " + hubKey,
+          kyivTime: kyivTimeStr,
+          directions: []
+        };
+      }
+
+      const stopNameById = {};
+      index.stops.forEach(s => stopNameById[s[0]] = s[1]);
+
+      const services = activeServiceIds(index);
+      const nowSec = getKyivSecondsOfDay();
+
+      // Live fleet grouped by route (realtime feed)
+      const rtVehicles = await loadRealtime(ctx);
+      const rtByRoute = {};
+      rtVehicles.forEach(v => {
+        if (v.routeId) (rtByRoute[v.routeId] ||= []).push(v);
+      });
+      const vehicleIndex = await loadVehicleIndex(ctx).catch(() => ({}));
+
+      // All upcoming departures across the resolved platforms of this hub.
+      // The same trip stopping at two nearby platforms counts once (earliest departure).
+      const upcoming = [];
+      const seenTrips = new Set();
+      for (const stopId of target.stopIds) {
+        for (const pair of (index.sched[stopId] || [])) {
+          const dep = pair[0], tripId = pair[1];
+          if (seenTrips.has(tripId)) continue;
+          const trip = index.trips[tripId];
+          if (!trip || !services.has(trip.s)) continue;
+          if (dep < nowSec - 60 || dep > nowSec + 2 * 3600 + 1800) continue;
+          seenTrips.add(tripId);
+          upcoming.push({ dep, tripId, trip, originStopId: stopId });
+        }
+      }
+      upcoming.sort((a, b) => a.dep - b.dep);
+
+      // Group into platform cards: route + destination direction
+      const groups = {};
+      for (const d of upcoming) {
+        const route = index.routes[d.trip.r] || { n: d.trip.r, t: -1, l: "" };
+        const destStopId = index.dest[d.tripId] || "";
+        const destName = stopNameById[destStopId] || route.l || "Кінцева зупинка";
+        const key = d.trip.r + ">" + destStopId;
+
+        if (!groups[key]) {
+          const type = ROUTE_TYPE_LABELS[route.t] || "ТРАНЗ";
+          groups[key] = {
+            id: "plat-" + Object.keys(groups).length,
+            title: "ПЛАТФОРМА · " + type + " (НАПРЯМОК: " + destName.toUpperCase() + ")",
+            type: type,
+            typeKey: route.t,
+            departures: []
+          };
+        }
+
+        // Live vehicle on this route → real municipal vehicle line
+        let vehicle = null;
+        const live = (rtByRoute[d.trip.r] || [])[0];
+        if (live) {
+          const plateDigits = String(live.licensePlate || "").match(/\d{3,}/);
+          const registry = plateDigits ? vehicleIndex[plateDigits[0]] : null;
+          vehicle = {
+            boardNumber: live.licensePlate || live.label || "—",
+            licensePlate: live.label && live.label !== live.licensePlate ? live.label : "—",
+            model: registry ? registry.model : "—",
+            isLowFloor: registry ? !!registry.lowFloor : false
+          };
+        }
+
+        // Timeline: this platform + next stops of the trip (official stop sequence)
+        const seq = index.tripStops[d.tripId] || [];
+        const i0 = seq.findIndex(x => x[0] === d.originStopId);
+        const tail = seq.slice(Math.max(i0, 0), Math.max(i0, 0) + CONFIG.TIMELINE_STOPS_LIMIT);
+        const stopsTimeline = tail.map((entry, i) => ({
+          name: stopNameById[entry[0]] || entry[0],
+          time: formatGtfsTime(entry[1]),
+          delayMin: 0,
+          status: i === 0 ? "current" : (i === tail.length - 1 ? "destination" : "intermediate")
+        }));
+
+        groups[key].departures.push({
+          route: route.n,
+          destination: destName,
+          time: formatGtfsTime(d.dep),
+          delayMin: 0,
+          remainingMinutes: Math.max(0, Math.round((d.dep - nowSec) / 60)),
+          vehicle: vehicle,
+          stops: stopsTimeline
+        });
+      }
+
+      const directions = Object.values(groups).map(g => {
+        g.departures.sort((a, b) => a.remainingMinutes - b.remainingMinutes);
+        g.departures = g.departures.slice(0, CONFIG.MAX_DEPARTURES_PER_CARD);
+        return g;
+      });
+
+      return {
+        hubKey: target.stopIds[0],
+        title: "Київ, " + target.title,
+        stopName: target.title,
+        kyivTime: kyivTimeStr,
+        directions,
+        feedVersion: index.version
       };
     }
 
-    // Extract ordered stop itinerary from relation members
-    const stopsItinerary = [];
-    if (Array.isArray(rel.members)) {
-      rel.members.forEach(mem => {
-        const stName = nodeMap.get(mem.ref);
-        if (stName && !stopsItinerary.includes(stName)) {
-          stopsItinerary.push(stName);
-        }
-      });
-    }
-
-    let itinerary = stopsItinerary;
-    if (itinerary.length === 0) {
-      itinerary = [canonicalName, destination];
-    }
-
-    let curIdx = itinerary.findIndex(st => st.toLowerCase().includes(rawQuery.toLowerCase()));
-    if (curIdx === -1) curIdx = 0;
-    const remainingStops = itinerary.slice(curIdx);
-
-    const headways = modeType === "МЕТРО" ? [3, 7, 12] : (modeType === "ПОЇЗД" ? [16, 36] : [5, 14, 25]);
-
-    // FIX: deduplicate — if this platform group already has a departure with the same routeRef,
-    // skip adding duplicate trips (happens when the same route appears in multiple relation variants)
-    const alreadyHasRoute = platformGroups[platKey].departures.some(d => d.route === routeRef);
-    if (alreadyHasRoute) return;
-
-    headways.forEach((offsetMin, tripIdx) => {
-      const scheduledTime = formatTimeWithOffset(now, offsetMin);
-      const vehicle = resolveDynamicVehicleFromTags(tags, routeRef, tripIdx);
-
-      const timeline = remainingStops.map((st, idx) => ({
-        name: st,
-        time: formatTimeWithOffset(now, offsetMin + idx * 2.5),
-        delayMin: 0,
-        status: idx === 0 ? "current" : (idx === remainingStops.length - 1 ? "destination" : "intermediate")
-      }));
-
-      platformGroups[platKey].departures.push({
-        route: routeRef,
-        destination: destination,
-        time: scheduledTime,
-        delayMin: 0,
-        remainingMinutes: offsetMin,
-        vehicle: vehicle,
-        stops: timeline
-      });
-    });
-  });
-
-  const directions = Object.values(platformGroups).map(plat => {
-    plat.departures.sort((a, b) => a.remainingMinutes - b.remainingMinutes);
-    return plat;
-  });
-
-  return {
-    title: canonicalName.startsWith("Київ") ? canonicalName : ("Київ, " + canonicalName),
-    stopCoordinates,
-    directions
-  };
-}
-
-/**
- * Universal Dynamic Resolver:
- * Queries the live Open Transit API directly for any station, stop, or street across Kyiv.
- */
-async function resolveHubDepartures(query, ctx = null) {
-  const normQuery = (query || CONFIG.DEFAULT_STOP).trim();
-  const cacheKey = new Request("https://kpt-cache.internal/api/hub/" + encodeURIComponent(normQuery.toLowerCase()));
-  const cache = typeof caches !== "undefined" ? caches.default : null;
-
-  // 1. Check Cloudflare Edge Cache API
-  if (cache) {
+  if (cacheStore) {
     try {
-      const hit = await cache.match(cacheKey);
+      const hit = await cacheStore.match(cacheKey);
       if (hit) {
-        const cached = await hit.json();
-        cached.kyivTime = formatTimeHM(getKyivNow());
-        return cached;
+        const hub = await hit.json();
+        hub.kyivTime = kyivTimeStr;
+        return hub;
       }
     } catch (_) {}
   }
 
-  const now = getKyivNow();
-  const kyivTimeStr = formatTimeHM(now);
+  const hub = await buildHub();
 
-  // 2. Fetch live transit graph from Overpass Public Transit API
-  let parsed = await fetchDynamicHubData(normQuery);
-
-  // 3. If direct name relation lookup was empty, query spatially around the stop's location
-  // Uses two-step approach: first get coords of matching stop, then find nearby stops + relations
-  if (!parsed || parsed.directions.length === 0) {
-    const cleanQ = sanitizeQuery(normQuery);
-    const BBOX = "50.213,30.239,50.590,30.825";
-
-    // Step 1: get the coordinates of the named stop node
-    const qlCoords = `
-      [out:json][timeout:5];
-      node["public_transport"~"platform|stop_position"]["name"~"${cleanQ}",i](${BBOX});
-      out 1;
-    `;
-    const coordEls = await executeOverpassQuery(qlCoords, 5);
-    const anchor = coordEls.find(e => e.lat && e.lon);
-
-    if (anchor) {
-      // Step 2: find all stops within 300m of the anchor coords and traverse up to route relations
-      const qlSpatial = `
-        [out:json][timeout:10];
-        (
-          node["public_transport"~"platform|stop_position"](around:300,${anchor.lat},${anchor.lon});
-          way["public_transport"~"platform"](around:300,${anchor.lat},${anchor.lon});
-        )->.nearby;
-        (
-          .nearby;
-          .nearby <;
-        );
-        out body;
-      `;
-      const spatialElements = await executeOverpassQuery(qlSpatial, 10);
-      parsed = parseOverpassTransitElements(spatialElements, normQuery);
-    }
-  }
-
-  // 4. If no routes found in open transit API, return clear zero-state without mock routes
-  if (!parsed || !parsed.directions || parsed.directions.length === 0) {
-    const cleanTitle = normQuery.startsWith("Київ") ? normQuery : ("Київ, " + normQuery);
-    parsed = {
-      title: cleanTitle,
-      directions: []
-    };
-  }
-
-  const resultHub = {
-    hubKey: normQuery.toLowerCase().replace(/\s+/g, "-"),
-    title: parsed.title,
-    kyivTime: kyivTimeStr,
-    directions: parsed.directions
-  };
-
-  // 5. Save to Cloudflare Edge Cache API
-  if (cache) {
+  // Cache only productive boards — empty hubs stay cheap to rebuild and never mask new data
+  if (cacheStore && hub.directions && hub.directions.length > 0) {
     try {
-      const edgeResponse = new Response(JSON.stringify(resultHub), {
+      await cacheStore.put(cacheKey, new Response(JSON.stringify(hub), {
         headers: {
           "Content-Type": "application/json; charset=utf-8",
-          "Cache-Control": "public, max-age=60, s-maxage=" + CONFIG.EDGE_CACHE_TTL_SEC
+          "Cache-Control": "public, max-age=" + CONFIG.HUB_TTL_SEC
         }
-      });
-      await cache.put(cacheKey, edgeResponse);
+      }));
     } catch (_) {}
   }
 
-  return resultHub;
+  hub.kyivTime = kyivTimeStr;
+  return hub;
 }
 
-/**
- * Server-Side Render: Generates Departure Direction Cards with verified "№ ... | ... | ♿" and clickable timeline stops.
- */
+/* ============================================================
+ * SEARCH — official stop registry
+ * ============================================================ */
+
+async function searchStops(query, ctx = null) {
+  const index = await loadGtfsIndex(ctx);
+  if (!index) return { results: [], unavailable: true };
+
+  const q = normalizeName(query);
+  if (q.length < 2) return { results: [] };
+
+  // 1. GTFS control points (departures available)
+  const byName = {};
+  for (const s of index.stops) {
+    const nameNorm = normalizeName(s[1]);
+    if (!nameNorm.includes(q)) continue;
+    const mode = STOP_MODE_LABELS[s[0].split("_")[0]] || "ТРАНЗ";
+    const entry = byName[s[1]] || (byName[s[1]] = { name: s[1], modeSet: new Set(), source: "gtfs" });
+    entry.modeSet.add(mode);
+  }
+
+  // 2. Official registry (ІАС «Майно») — metro, funicular, city express and full street names
+  const mayno = await loadMaynoStops().catch(() => []);
+  const seenNames = new Set(Object.keys(byName).map(n => normalizeName(n)));
+  for (const m of mayno) {
+    if (!normalizeName(m[0]).includes(q)) continue;
+    if (seenNames.has(normalizeName(m[0]))) continue;
+    seenNames.add(normalizeName(m[0]));
+    byName[m[0]] = { name: m[0], modeSet: new Set([maynoBadge(m[0])]), source: "mayno" };
+  }
+
+  const results = Object.values(byName).map(e => ({
+    name: e.name,
+    modes: [...e.modeSet].join(", ") || "Київ"
+  }));
+
+  // Rank: prefix matches first, then alphabetical
+  results.sort((a, b) => {
+    const ap = normalizeName(a.name).startsWith(q) ? 0 : 1;
+    const bp = normalizeName(b.name).startsWith(q) ? 0 : 1;
+    return ap - bp || a.name.localeCompare(b.name, "uk");
+  });
+
+  return { results: results.slice(0, 12) };
+}
+
+/** Badge for official-registry stops (the registry has no machine-readable type). */
+function maynoBadge(label) {
+  const n = String(label).toLowerCase();
+  if (n.includes("ст.м.") || n.includes("метро")) return "МЕТРО";
+  if (n.includes("фунікул")) return "ФУНІКУЛЕР";
+  if (n.includes("електричка") || n.includes("city express")) return "ЕЛЕКТРИЧКА";
+  return "КИЇВ";
+}
+
+/* ============================================================
+ * SERVER-SIDE RENDER — departure board UI (unchanged layout)
+ * ============================================================ */
+
 function renderDirectionCardsHtml(hubData) {
+  if (hubData.unavailable) {
+    return "<div style='grid-column: 1 / -1; padding: 40px 20px; text-align: center; color: #f85149; background: #161b22; border: 1px solid #30363d; border-radius: 8px;'>⚠ Розклад КП «Київпастранс» (GTFS) тимчасово недоступний. Спробуйте оновити сторінку за кілька хвилин.</div>";
+  }
   if (!hubData.directions || hubData.directions.length === 0) {
-    return "<div style='grid-column: 1 / -1; padding: 40px 20px; text-align: center; color: #8b949e; background: #161b22; border: 1px solid #30363d; border-radius: 8px;'>За даними відкритого транзитного реєстру, діючих рейсів для цієї локації не знайдено. Спробуйте іншу зупинку через пошук.</div>";
+    return "<div style='grid-column: 1 / -1; padding: 40px 20px; text-align: center; color: #8b949e; background: #161b22; border: 1px solid #30363d; border-radius: 8px;'>За офіційним розкладом КП «Київпастранс» на цю зупинку рейсів у найближчі 2 години не знайдено. Спробуйте іншу зупинку через пошук.</div>";
   }
   return hubData.directions.map(dir => {
     const departures = dir.departures || [];
@@ -419,7 +748,7 @@ function renderDirectionCardsHtml(hubData) {
       const distText = distMeters > 1000 ? (distMeters / 1000).toFixed(1) + " км" : distMeters + " м";
       const tripId = "trip-" + dir.id + "-" + idx;
 
-      // Strict municipal vehicle format: "№ 1524 | AA 1524 BP | Богдан А701.32 | ♿"
+      // Municipal vehicle line: "№ 8648 | 131Н | Е249 МАЗ | ♿" — real data or honest dashes
       const veh = item.vehicle || { boardNumber: "—", licensePlate: "—", model: "—", isLowFloor: false };
       const lowFloorTag = veh.isLowFloor ? ' | <span class="vehicle-accessibility" title="Низька підлога">♿</span>' : '';
       const vehicleInfoBarHtml = '<div class="vehicle-info-bar">' +
@@ -429,7 +758,6 @@ function renderDirectionCardsHtml(hubData) {
         lowFloorTag +
       '</div>';
 
-      // Vertical timeline for sequential stops — each stop is an active link (↗)
       const timelineHtml = (item.stops || []).map(st => {
         let dotClass = "dot-intermediate";
         let textClass = "name-intermediate";
@@ -456,11 +784,8 @@ function renderDirectionCardsHtml(hubData) {
         '</div>';
       }).join("");
 
-      let routeClass = "route-badge";
-      if (item.route.startsWith("М")) routeClass = "route-badge metro";
-      else if (item.route.includes("КМЕ") || item.route.includes("ПОЇЗД") || dir.type === "ПОЇЗД") routeClass = "route-badge train";
-      else if (dir.type === "ТРАМ") routeClass = "route-badge tram";
-      else if (dir.type === "ТРОЛ") routeClass = "route-badge trolley";
+      const typeClass = ROUTE_TYPE_CLASSES[dir.typeKey] || "bus";
+      const routeClass = "route-badge " + (typeClass !== "bus" ? typeClass : "");
 
       return '<div class="departure-item-wrapper">' +
         '<div class="departure-row" onclick="toggleTripDetails(\'' + tripId + '\')">' +
@@ -485,11 +810,7 @@ function renderDirectionCardsHtml(hubData) {
       '</div>';
     }).join("");
 
-    let typeClass = "bus";
-    if (dir.type === "МЕТРО") typeClass = "metro";
-    else if (dir.type === "ПОЇЗД") typeClass = "train";
-    else if (dir.type === "ТРАМ") typeClass = "tram";
-    else if (dir.type === "ТРОЛ") typeClass = "trolley";
+    const typeClass = ROUTE_TYPE_CLASSES[dir.typeKey] || "bus";
 
     return '<div class="board-card">' +
       '<div class="card-header">' +
@@ -514,11 +835,26 @@ function renderDirectionCardsHtml(hubData) {
   }).join("");
 }
 
+function formatMinutes(minutes) {
+  if (minutes <= 0) return "<span class='eta-cell' style='color:#3fb950'>0'</span>";
+  if (minutes >= 60) {
+    const hrs = Math.floor(minutes / 60);
+    const mins = minutes % 60;
+    return "<span class='eta-cell hours'>" + hrs + "h " + mins + "'</span>";
+  }
+  return "<span class='eta-cell'>" + minutes + "'</span>";
+}
+
 /**
- * Server-Side Render: Generates full HTML page with universal search bar and German Abfahrtsmonitor layout.
+ * Server-Side Render: full page with universal search bar over the official stop registry.
  */
 function renderFullPageHtml(hubData) {
   const initialCardsHtml = renderDirectionCardsHtml(hubData);
+  // typeKey is needed by the client-side renderer, inject it next to each direction
+  const hubPayload = { ...hubData };
+  if (hubPayload.directions) {
+    hubPayload.directions = hubPayload.directions.map(d => ({ ...d, typeKey: typeKeyOf(d.type) }));
+  }
 
   return '<!DOCTYPE html>' +
 '<html lang="uk">' +
@@ -631,6 +967,8 @@ function renderFullPageHtml(hubData) {
       'border-radius: 4px;' +
       'font-weight: 600;' +
     '}' +
+    '.search-item-muted { color: #8b949e; cursor: default; }' +
+    '.search-item-muted:hover { background: transparent; color: #8b949e; }' +
 
     '.departure-grid {' +
       'display: grid;' +
@@ -754,7 +1092,7 @@ function renderFullPageHtml(hubData) {
     '}' +
     '.eta-cell.hours { color: var(--text-muted); font-size: 0.9rem; font-weight: 600; }' +
 
-    /* Minimalist Vehicle Info Bar matching strictly "№ 1524 | AA 1524 BP | Богдан А701.32 | ♿" */
+    /* Vehicle info line: "№ board | label | model | ♿" */
     '.vehicle-info-bar {' +
       'font-size: 0.88rem;' +
       'font-weight: 600;' +
@@ -854,12 +1192,12 @@ function renderFullPageHtml(hubData) {
       '<div class="station-title" id="stationTitle">' + hubData.title + '</div>' +
       '<div class="header-actions">' +
         '<div class="clock-badge" id="clockBadge">' + hubData.kyivTime + ' (Київ)</div>' +
-        '<button class="btn-icon btn-search" id="refreshBtn">⟳ Оновити GPS</button>' +
+        '<button class="btn-icon btn-search" id="refreshBtn">⟳ Оновити табло</button>' +
         '<button class="btn-icon btn-fav" id="favBtn" title="Додати в обране">★</button>' +
       '</div>' +
     '</div>' +
     '<div class="search-bar-wrapper">' +
-      '<input type="text" id="stopSearchInput" class="search-input" placeholder="🔍 Введіть назву будь-якої зупинки Києва (напр. Позняки, Видубичі, Дарницька площа, Хрещатик)..." autocomplete="off" />' +
+      '<input type="text" id="stopSearchInput" class="search-input" placeholder="🔍 Назва зупинки КП «Київпастранс» (напр. Позняки, Хрещатик, Контрактова площа, вул. Скляренка)..." autocomplete="off" />' +
       '<div id="searchResults" class="search-dropdown" style="display:none;"></div>' +
     '</div>' +
     '<div class="departure-grid" id="departureGrid">' +
@@ -874,8 +1212,8 @@ function renderFullPageHtml(hubData) {
     'const clockBadge = document.getElementById("clockBadge");' +
     'const searchInput = document.getElementById("stopSearchInput");' +
     'const searchDropdown = document.getElementById("searchResults");' +
-    'let currentStop = "' + hubData.hubKey + '";' +
-    'let currentHub = ' + JSON.stringify(hubData) + ';' +
+    'let currentStop = "' + (hubData.stopName || hubData.hubKey).replace(/"/g, '\\"') + '";' +
+    'let currentHub = ' + JSON.stringify(hubPayload) + ';' +
     'const expanded = {};' +
 
     'function updateClock() {' +
@@ -912,6 +1250,10 @@ function renderFullPageHtml(hubData) {
       'window.scrollTo({ top: 0, behavior: "smooth" });' +
     '};' +
 
+    'function escapeHtml(s) {' +
+      'return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");' +
+    '}' +
+
     'function render(hub) {' +
       'currentHub = hub;' +
       'stationTitle.textContent = hub.title;' +
@@ -925,9 +1267,9 @@ function renderFullPageHtml(hubData) {
           'const veh = item.vehicle || { boardNumber: "—", licensePlate: "—", model: "—", isLowFloor: false };' +
           'const lowFloorTag = veh.isLowFloor ? " | <span class=\\"vehicle-accessibility\\" title=\\"Низька підлога\\">♿</span>" : "";' +
           'const vehBar = "<div class=\\"vehicle-info-bar\\">" +' +
-            '"<span class=\\"vehicle-board\\">№ " + veh.boardNumber + "</span> | " +' +
-            '"<span class=\\"vehicle-plate\\">" + veh.licensePlate + "</span> | " +' +
-            '"<span class=\\"vehicle-model\\">" + veh.model + "</span>" +' +
+            '"<span class=\\"vehicle-board\\">№ " + escapeHtml(veh.boardNumber) + "</span> | " +' +
+            '"<span class=\\"vehicle-plate\\">" + escapeHtml(veh.licensePlate) + "</span> | " +' +
+            '"<span class=\\"vehicle-model\\">" + escapeHtml(veh.model) + "</span>" +' +
             'lowFloorTag +' +
           '"</div>";' +
           'const timeline = (item.stops || []).map(st => {' +
@@ -943,10 +1285,8 @@ function renderFullPageHtml(hubData) {
             '"</div>";' +
           '}).join("");' +
           'let routeCls = "route-badge";' +
-          'if (item.route.startsWith("М")) routeCls = "route-badge metro";' +
-          'else if (item.route.includes("КМЕ") || item.route.includes("ПОЇЗД") || dir.type === "ПОЇЗД") routeCls = "route-badge train";' +
-          'else if (dir.type === "ТРАМ") routeCls = "route-badge tram";' +
-          'else if (dir.type === "ТРОЛ") routeCls = "route-badge trolley";' +
+          'const tc = ROUTE_TYPE_CLASSES[dir.typeKey] || "bus";' +
+          'if (tc !== "bus") routeCls = "route-badge " + tc;' +
           'return "<div class=\\"departure-item-wrapper\\">" +' +
             '"<div class=\\"departure-row\\" onclick=\\"toggleTripDetails(\\\'" + tripId + "\\\')\\">" +' +
               '"<div class=\\"route-cell\\">" +' +
@@ -965,14 +1305,10 @@ function renderFullPageHtml(hubData) {
             '"</div>" +' +
           '"</div>";' +
         '}).join("");' +
-        'let typeCls = "bus";' +
-        'if (dir.type === "МЕТРО") typeCls = "metro";' +
-        'else if (dir.type === "ПОЇЗД") typeCls = "train";' +
-        'else if (dir.type === "ТРАМ") typeCls = "tram";' +
-        'else if (dir.type === "ТРОЛ") typeCls = "trolley";' +
+        'const tCls = ROUTE_TYPE_CLASSES[dir.typeKey] || "bus";' +
         'return "<div class=\\"board-card\\">" +' +
           '"<div class=\\"card-header\\">" +' +
-            '"<span class=\\"type-badge " + typeCls + "\\">" + dir.type + "</span>" +' +
+            '"<span class=\\"type-badge " + tCls + "\\">" + dir.type + "</span>" +' +
             '"<span class=\\"platform-title\\">" + dir.title + "</span>" +' +
           '"</div>" +' +
           '"<div class=\\"table-columns\\">" +' +
@@ -988,7 +1324,7 @@ function renderFullPageHtml(hubData) {
             '"</button>" +' +
           '"</div>" +' +
         '"</div>";' +
-      '}).join("");' +
+      '}).join("") || "<div style=\'grid-column: 1 / -1; padding: 40px 20px; text-align: center; color: #8b949e; background: #161b22; border: 1px solid #30363d; border-radius: 8px;\'>За офіційним розкладом КП «Київпастранс» рейсів на цю зупинку в найближчі 2 години не знайдено.</div>";' +
     '}' +
 
     'async function selectStop(key) {' +
@@ -1000,10 +1336,11 @@ function renderFullPageHtml(hubData) {
       'refreshBtn.textContent = "⟳ Оновлення...";' +
       'try {' +
         'const res = await fetch("/api/hub?stop=" + encodeURIComponent(key));' +
+        'if (!res.ok) throw new Error("HTTP " + res.status);' +
         'const hub = await res.json();' +
         'render(hub);' +
       '} catch(e) {}' +
-      'refreshBtn.textContent = "⟳ Оновити GPS";' +
+      'refreshBtn.textContent = "⟳ Оновити табло";' +
     '}' +
 
     'let searchDebounce = null;' +
@@ -1011,23 +1348,25 @@ function renderFullPageHtml(hubData) {
       'clearTimeout(searchDebounce);' +
       'const val = searchInput.value.trim();' +
       'if (!val) { searchDropdown.style.display = "none"; return; }' +
+      'searchDropdown.innerHTML = "<div class=\\"search-item search-item-muted\\"><span>⏳ Пошук зупинок у реєстрі КП «Київпастранс»...</span></div>";' +
+      'searchDropdown.style.display = "block";' +
       'searchDebounce = setTimeout(async () => {' +
         'try {' +
           'const res = await fetch("/api/search?q=" + encodeURIComponent(val));' +
+          'if (!res.ok) throw new Error("HTTP " + res.status);' +
           'const data = await res.json();' +
           'if (data.results && data.results.length > 0) {' +
-            'searchDropdown.innerHTML = data.results.slice(0, 8).map(s => {' +
-              'const name = s.name || s.stop_name || val;' +
-              'const badge = s.modes ? "<span class=\\"search-item-badge\\">" + s.modes + "</span>" : "<span class=\\"search-item-badge\\">Київ</span>";' +
-              'return "<div class=\\"search-item\\" data-key=\\"" + encodeURIComponent(name) + "\\"><span>" + name + "</span>" + badge + "</div>";' +
+            'searchDropdown.innerHTML = data.results.map(s => {' +
+              'const name = s.name || val;' +
+              'const badge = "<span class=\\"search-item-badge\\">" + (s.modes || "Київ") + "</span>";' +
+              'return "<div class=\\"search-item\\" data-key=\\"" + encodeURIComponent(name) + "\\"><span>" + escapeHtml(name) + "</span>" + badge + "</div>";' +
             '}).join("");' +
-            'searchDropdown.style.display = "block";' +
           '} else {' +
-            'searchDropdown.innerHTML = "<div class=\\"search-item\\" data-key=\\"" + encodeURIComponent(val) + "\\"><span>Пошук: <b>" + val + "</b></span><span class=\\"search-item-badge\\">Показати табло ↗</span></div>";' +
-            'searchDropdown.style.display = "block";' +
+            'searchDropdown.innerHTML = "<div class=\\"search-item\\" data-key=\\"" + encodeURIComponent(val) + "\\"><span>Нічого не знайдено: <b>" + escapeHtml(val) + "</b></span><span class=\\"search-item-badge\\">Все одно відкрити табло ↗</span></div>";' +
           '}' +
+          'searchDropdown.style.display = "block";' +
         '} catch(_) {' +
-          'searchDropdown.innerHTML = "<div class=\\"search-item\\" data-key=\\"" + encodeURIComponent(val) + "\\"><span>Пошук: <b>" + val + "</b></span><span class=\\"search-item-badge\\">Показати табло ↗</span></div>";' +
+          'searchDropdown.innerHTML = "<div class=\\"search-item\\" data-key=\\"" + encodeURIComponent(val) + "\\"><span>⚠ Сервіс розкладу тимчасово недоступний</span><span class=\\"search-item-badge\\">Відкрити «" + escapeHtml(val) + "» ↗</span></div>";' +
           'searchDropdown.style.display = "block";' +
         '}' +
       '}, 200);' +
@@ -1062,16 +1401,27 @@ function renderFullPageHtml(hubData) {
       'const p = new URLSearchParams(window.location.search);' +
       'selectStop(p.get("stop") || "' + CONFIG.DEFAULT_STOP + '");' +
     '});' +
+    'const ROUTE_TYPE_CLASSES = { 0: "tram", 11: "trolley", 3: "bus", 1: "metro", 2: "train" };' +
+    'updateClock();' +
   '</script>' +
 '</body>' +
 '</html>';
 }
 
-/**
- * Cloudflare Worker Export (Fetch Handler).
- */
+function typeKeyOf(typeLabel) {
+  const entry = Object.entries(ROUTE_TYPE_LABELS).find(([, label]) => label === typeLabel);
+  return entry ? Number(entry[0]) : 3;
+}
+
+/* ============================================================
+ * Cloudflare Worker Export (Fetch + Scheduled Handlers)
+ * ============================================================ */
+
 export default {
-  async scheduled(event, env, ctx) {},
+  // Cron: refresh the GTFS index nightly so the first morning request is instant
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(loadGtfsIndex(null, true));
+  },
 
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -1088,7 +1438,7 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // 1. Root route: Server-Side Rendered (SSR) HTML via dynamic API fetch
+    // 1. Root route: Server-Side Rendered HTML board
     if (pathname === "/" || pathname === "/index.html") {
       const stopQuery = searchParams.get("stop") || CONFIG.DEFAULT_STOP;
       const hubData = await resolveHubDepartures(stopQuery, ctx);
@@ -1098,54 +1448,22 @@ export default {
       });
     }
 
-    // 2. Dynamic Hub Departures API
+    // 2. Departure board API
     if (pathname === "/api/hub") {
       const stopQuery = searchParams.get("stop") || CONFIG.DEFAULT_STOP;
       const hubData = await resolveHubDepartures(stopQuery, ctx);
       return new Response(JSON.stringify(hubData), { headers: corsHeaders });
     }
 
-    // 3. Dynamic Search API querying live transit stops across Kyiv
+    // 3. Stop search API over the official stop registry
     if (pathname === "/api/search") {
-      const query = sanitizeQuery(searchParams.get("q") || "");
-      let results = [];
-
-      if (query.length >= 2) {
-        // Kyiv bbox — same approach as main query, avoids area["admin_level"] OSM inconsistencies
-        const BBOX = "50.213,30.239,50.590,30.825";
-        const qlSearch = `
-          [out:json][timeout:5];
-          node["public_transport"~"platform|stop_position"]["name"~"${query}",i](${BBOX});
-          out tags 12;
-        `;
-        const elements = await executeOverpassQuery(qlSearch, 5);
-
-        const seen = new Set();
-        elements.forEach(el => {
-          const name = el.tags && el.tags.name;
-          if (name && !seen.has(name)) {
-            seen.add(name);
-            const modes = [];
-            if (el.tags.subway === "yes" || (el.tags.railway && el.tags.railway.includes("subway"))) modes.push("МЕТРО");
-            if (el.tags.tram === "yes") modes.push("ТРАМ");
-            if (el.tags.bus === "yes") modes.push("АВТ");
-            if (el.tags.trolleybus === "yes") modes.push("ТРОЛ");
-            results.push({
-              name,
-              modes: modes.join(", ") || "Київ"
-            });
-          }
-        });
-      }
-
-      return new Response(JSON.stringify({ results }), { headers: corsHeaders });
+      const data = await searchStops(searchParams.get("q") || "", ctx);
+      return new Response(JSON.stringify(data), { headers: corsHeaders });
     }
 
-    // 4. Live Fleet API
+    // 4. Live fleet API (GTFS-RT positions)
     if (pathname === "/api/live") {
-      const stopQuery = searchParams.get("stop") || CONFIG.DEFAULT_STOP;
-      const hubData = await resolveHubDepartures(stopQuery, ctx);
-      const vehicles = hubData.directions.flatMap(d => d.departures.map(dep => dep.vehicle));
+      const vehicles = await loadRealtime(ctx);
       return new Response(JSON.stringify({ vehicles, timestamp: new Date().toISOString() }), {
         headers: corsHeaders
       });
