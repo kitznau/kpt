@@ -45,8 +45,68 @@ const CONFIG = {
   MAX_DEPARTURES_PER_CARD: 10,
   TIMELINE_STOPS_LIMIT: 8,
 
-  USER_AGENT: "KPT-Departure-Monitor/3.0 (Kyiv City Open Data Engine)"
+  USER_AGENT: "KPT-Departure-Monitor/3.0 (Kyiv City Open Data Engine)",
+
+  // The municipal feeds (193.23.225.x) answer 403 to requests coming from
+  // cloud-provider IPs (incl. Cloudflare egress) while serving residential
+  // IPs normally. These public CORS relays are used ONLY as fallback paths
+  // and for the /api/debug-sources probe — the URLs themselves are the same
+  // official feeds, just relayed.
+  RELAY_URLS: [
+    "https://api.allorigins.win/raw?url=",
+    "https://api.codetabs.com/v1/proxy?quest="
+  ],
+  BROWSER_UA: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+  PORTAL_REFERER: "https://data.kyivcity.gov.ua/"
 };
+
+/* ============================================================
+ * SOURCE PROBE — used by /api/debug-sources to find a fetch path
+ * that works from the edge (direct vs browser-UA vs relay).
+ * ============================================================ */
+
+const FETCH_VARIANTS = [
+  { id: "direct", make: url => ({ url, headers: { "User-Agent": CONFIG.USER_AGENT } }) },
+  { id: "browser-ua", make: url => ({ url, headers: { "User-Agent": CONFIG.BROWSER_UA } }) },
+  { id: "browser-ua+referer", make: url => ({ url: url, headers: { "User-Agent": CONFIG.BROWSER_UA, "Referer": CONFIG.PORTAL_REFERER } }) },
+  ...CONFIG.RELAY_URLS.map((relay, i) => ({
+    id: "relay" + (i + 1),
+    make: url => ({ url: relay + encodeURIComponent(url), headers: { "User-Agent": CONFIG.USER_AGENT } })
+  }))
+];
+
+async function probeVariant(url, variant) {
+  const started = Date.now();
+  try {
+    const opts = variant.make(url);
+    const res = await fetch(opts.url, { headers: opts.headers, signal: AbortSignal.timeout(20000) });
+    let bytes = 0;
+    try { const ab = await res.arrayBuffer(); bytes = ab.byteLength; } catch (_) {}
+    return {
+      variant: variant.id,
+      status: res.status,
+      contentType: res.headers.get("content-type") || "",
+      bytes,
+      ms: Date.now() - started
+    };
+  } catch (err) {
+    return { variant: variant.id, status: 0, error: (err && err.message) || String(err), ms: Date.now() - started };
+  }
+}
+
+async function probeSources() {
+  const sources = [
+    { name: "gtfs-static", url: CONFIG.GTFS_STATIC_URL },
+    { name: "realtime", url: CONFIG.REALTIME_URL },
+    { name: "mayno-stops", url: CONFIG.MAYNO_STOPS_URL },
+    { name: "vehicles", url: CONFIG.VEHICLES_URL }
+  ];
+  const results = {};
+  await Promise.all(sources.map(async s => {
+    results[s.name] = await Promise.all(FETCH_VARIANTS.map(v => probeVariant(s.url, v)));
+  }));
+  return { probedAt: new Date().toISOString(), results };
+}
 
 /* ============================================================
  * TIME HELPERS (Europe/Kyiv — computed arithmetically)
@@ -152,10 +212,29 @@ async function readZipEntry(buf, entry) {
   throw new Error("ZIP: unsupported compression method " + entry.method);
 }
 
-/** RFC-4180-ish CSV parser (handles quoted fields with embedded commas/quotes). */
+/** RFC-4180-ish CSV parser (handles quoted fields with embedded commas/quotes).
+ *  Streams rows into objects one by one — never retains the raw row matrix,
+ *  which matters on the 115k-row stop_times table (isolate memory limit). */
 function csvObjects(text) {
-  const rows = [];
+  const results = [];
   let i = 0, field = "", row = [], inQ = false;
+  // Strip BOM if present
+  if (text.charCodeAt(0) === 0xFEFF) i = 1;
+
+  let header = null;
+  const flushRow = () => {
+    row.push(field);
+    field = "";
+    if (header === null) {
+      header = row.map(h => h.trim());
+    } else if (row.length >= header.length && row.some(c => c !== "")) {
+      const o = {};
+      header.forEach((h, idx) => o[h] = (row[idx] || "").trim());
+      results.push(o);
+    }
+    row = [];
+  };
+
   while (i < text.length) {
     const c = text[i];
     if (inQ) {
@@ -167,20 +246,12 @@ function csvObjects(text) {
     }
     if (c === '"') { inQ = true; i++; continue; }
     if (c === ",") { row.push(field); field = ""; i++; continue; }
-    if (c === "\n") { row.push(field); field = ""; rows.push(row); row = []; i++; continue; }
+    if (c === "\n") { flushRow(); i++; continue; }
     if (c === "\r") { i++; continue; }
     field += c; i++;
   }
-  if (field.length || row.length) { row.push(field); rows.push(row); }
-  if (rows.length === 0) return [];
-  const head = rows[0].map(h => h.trim());
-  return rows.slice(1)
-    .filter(r => r.length >= head.length && r.some(c => c !== ""))
-    .map(r => {
-      const o = {};
-      head.forEach((h, idx) => o[h] = (r[idx] || "").trim());
-      return o;
-    });
+  if (field.length || row.length) flushRow();
+  return results;
 }
 
 /** Generic protobuf walker: calls cb(fieldNumber, wireType, value) for every field. */
@@ -360,12 +431,21 @@ async function buildGtfsIndex() {
 
 let gtfsMemo = null;
 
-/** Loads the GTFS index: module memo → edge cache → fresh build. */
+/**
+ * Loads the GTFS index: module memo → edge cache → fresh build.
+ * Download/parse failures return null (the board degrades to an honest
+ * "unavailable" message) instead of bubbling an exception into a 1101 page.
+ */
 async function loadGtfsIndex(ctx = null, force = false) {
   if (!force && gtfsMemo) return gtfsMemo;
-  const index = await cachedJson("https://kpt-cache.internal/gtfs-index-v3", CONFIG.GTFS_INDEX_TTL_SEC, buildGtfsIndex);
-  if (index) gtfsMemo = index;
-  return index;
+  try {
+    const index = await cachedJson("https://kpt-cache.internal/gtfs-index-v3", CONFIG.GTFS_INDEX_TTL_SEC, buildGtfsIndex);
+    if (index) gtfsMemo = index;
+    return index;
+  } catch (err) {
+    console.error("GTFS index load failed:", (err && err.message) || err);
+    return null;
+  }
 }
 
 /** Vehicle registry (open data): { "4-digit board no.": {model, lowFloor} } */
@@ -1420,13 +1500,10 @@ function typeKeyOf(typeLabel) {
 export default {
   // Cron: refresh the GTFS index nightly so the first morning request is instant
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(loadGtfsIndex(null, true));
+    ctx.waitUntil(loadGtfsIndex(null, true).catch(() => {}));
   },
 
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const { pathname, searchParams } = url;
-
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
@@ -1438,40 +1515,59 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // 1. Root route: Server-Side Rendered HTML board
-    if (pathname === "/" || pathname === "/index.html") {
-      const stopQuery = searchParams.get("stop") || CONFIG.DEFAULT_STOP;
-      const hubData = await resolveHubDepartures(stopQuery, ctx);
-      const html = renderFullPageHtml(hubData);
-      return new Response(html, {
-        headers: { "Content-Type": "text/html; charset=utf-8" }
-      });
-    }
+    // Any unexpected failure must surface as a readable 500 JSON diagnostic
+    // (message + stack) instead of the opaque Cloudflare "Error 1101" page.
+    try {
+      const url = new URL(request.url);
+      const { pathname, searchParams } = url;
 
-    // 2. Departure board API
-    if (pathname === "/api/hub") {
-      const stopQuery = searchParams.get("stop") || CONFIG.DEFAULT_STOP;
-      const hubData = await resolveHubDepartures(stopQuery, ctx);
-      return new Response(JSON.stringify(hubData), { headers: corsHeaders });
-    }
+      // 1. Root route: Server-Side Rendered HTML board
+      if (pathname === "/" || pathname === "/index.html") {
+        const stopQuery = searchParams.get("stop") || CONFIG.DEFAULT_STOP;
+        const hubData = await resolveHubDepartures(stopQuery, ctx);
+        const html = renderFullPageHtml(hubData);
+        return new Response(html, {
+          headers: { "Content-Type": "text/html; charset=utf-8" }
+        });
+      }
 
-    // 3. Stop search API over the official stop registry
-    if (pathname === "/api/search") {
-      const data = await searchStops(searchParams.get("q") || "", ctx);
-      return new Response(JSON.stringify(data), { headers: corsHeaders });
-    }
+      // 2. Departure board API
+      if (pathname === "/api/hub") {
+        const stopQuery = searchParams.get("stop") || CONFIG.DEFAULT_STOP;
+        const hubData = await resolveHubDepartures(stopQuery, ctx);
+        return new Response(JSON.stringify(hubData), { headers: corsHeaders });
+      }
 
-    // 4. Live fleet API (GTFS-RT positions)
-    if (pathname === "/api/live") {
-      const vehicles = await loadRealtime(ctx);
-      return new Response(JSON.stringify({ vehicles, timestamp: new Date().toISOString() }), {
+      // 3. Stop search API over the official stop registry
+      if (pathname === "/api/search") {
+        const data = await searchStops(searchParams.get("q") || "", ctx);
+        return new Response(JSON.stringify(data), { headers: corsHeaders });
+      }
+
+      // 4. Live fleet API (GTFS-RT positions)
+      if (pathname === "/api/live") {
+        const vehicles = await loadRealtime(ctx);
+        return new Response(JSON.stringify({ vehicles, timestamp: new Date().toISOString() }), {
+          headers: corsHeaders
+        });
+      }
+
+      // 5. Source reachability probe (diagnostics for the edge network path)
+      if (pathname === "/api/debug-sources") {
+        const probe = await probeSources();
+        return new Response(JSON.stringify(probe), { headers: corsHeaders });
+      }
+
+      return new Response(JSON.stringify({ error: "Endpoint not found" }), {
+        status: 404,
         headers: corsHeaders
       });
+    } catch (err) {
+      return new Response(JSON.stringify({
+        error: true,
+        message: (err && err.message) ? err.message : String(err),
+        stack: (err && err.stack) ? err.stack : ""
+      }), { status: 500, headers: corsHeaders });
     }
-
-    return new Response(JSON.stringify({ error: "Endpoint not found" }), {
-      status: 404,
-      headers: corsHeaders
-    });
   }
 };
