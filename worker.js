@@ -46,6 +46,7 @@ const CONFIG = {
   TIMELINE_STOPS_LIMIT: 8,
 
   USER_AGENT: "KPT-Departure-Monitor/3.0 (Kyiv City Open Data Engine)",
+  ADMIN_TOKEN: "kpt-9f4c31e7a2b84d05",
 
   // The municipal feeds (193.23.225.x) answer 403 to requests coming from
   // cloud-provider IPs (incl. Cloudflare egress) while serving residential
@@ -1636,6 +1637,45 @@ export default {
       if (pathname === "/api/debug-sources") {
         const probe = await probeSources();
         return new Response(JSON.stringify(probe), { headers: corsHeaders });
+      }
+
+      // 6. Admin import: receive a prebuilt GTFS index (built by build-index.mjs
+      //    on a network the origin does not 403) and cache it as the live index.
+      if (pathname === "/api/admin/import-index" && request.method === "POST") {
+        if ((request.headers.get("x-admin-token") || "") !== CONFIG.ADMIN_TOKEN) {
+          return new Response(JSON.stringify({ error: "invalid admin token" }), { status: 403, headers: corsHeaders });
+        }
+        let data;
+        try {
+          data = JSON.parse(await request.text());
+        } catch (_) {
+          return new Response(JSON.stringify({ error: "body is not valid JSON" }), { status: 400, headers: corsHeaders });
+        }
+        if (!data || !Array.isArray(data.stops) || data.stops.length < 100 || !data.sched || !data.trips || !data.calendar) {
+          return new Response(JSON.stringify({ error: "payload does not look like a GTFS index" }), { status: 400, headers: corsHeaders });
+        }
+        data.fetchedAtMs = Date.now();
+        data.importedVia = "admin";
+        gtfsMemo = data;
+        if (cacheStore) {
+          try {
+            await cacheStore.put(new Request(GTFS_CACHE_KEY), new Response(JSON.stringify({
+              data, fetchedAt: Date.now()
+            }), {
+              headers: {
+                "Content-Type": "application/json; charset=utf-8",
+                "Cache-Control": "public, max-age=" + 7 * 24 * 3600
+              }
+            }));
+          } catch (_) {}
+        }
+        return new Response(JSON.stringify({
+          imported: true,
+          version: data.version || "",
+          stops: data.stops.length,
+          trips: Object.keys(data.trips).length,
+          departures: Object.values(data.sched).reduce((a, r) => a + r.length, 0)
+        }), { headers: corsHeaders });
       }
 
       return new Response(JSON.stringify({ error: "Endpoint not found" }), {
