@@ -192,7 +192,10 @@ async function fetchBytesRace(url, variants, minBytes, validate, budgetMs) {
 async function fetchJsonWithTimeout(url, timeoutMs, label) {
   const res = await fetch(url, { headers: { "User-Agent": CONFIG.USER_AGENT }, signal: AbortSignal.timeout(timeoutMs) });
   if (!res.ok) throw new Error(label + " download failed: HTTP " + res.status);
-  return res.json();
+  // The city portal prefixes JSON bodies with a UTF-8 BOM; res.json() would die on it.
+  let text = await res.text();
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+  return JSON.parse(text);
 }
 
 /* ============================================================
@@ -1038,10 +1041,12 @@ async function buildHub(hubKey, ctx, env) {
 
     groups[key].departures.push({
       tripId: d.tripId,
+      routeId: d.trip.r,
       route: route.n,
       destination: destName,
       time: formatGtfsTime(d.abs),
       depAbs: d.abs,
+      originPos: stopPosById[d.originStopId] || null,
       delayMin: 0,
       remainingMinutes: Math.max(0, Math.round((d.abs - nowSec) / 60)),
       vehicle,
@@ -1591,16 +1596,15 @@ const CLIENT_JS = String.raw`
     return "<span class=\"eta-cell\">" + m + "'</span>";
   }
 
-  function distanceText(item) {
-    var d = item.vehicle && typeof item.vehicle.distanceM === "number" ? item.vehicle.distanceM : null;
-    if (d === null) return "—";
-    return d >= 1000 ? (d / 1000).toFixed(1) + " км" : d + " м";
-  }
-
   function vehicleBar(veh) {
     var v = veh || { boardNumber: "—", licensePlate: "—", model: "—", isLowFloor: false };
+    var boardTitle = v.matched === "trip"
+      ? "Машина цього рейсу за даними GPS (точне співставлення)"
+      : v.matched === "route"
+        ? "Найближча машина цього маршруту за даними GPS (наближене співставлення)"
+        : "";
     return "<div class=\"vehicle-info-bar\">" +
-      "<span class=\"vehicle-board\">№ " + escapeHtml(v.boardNumber) + "</span> | " +
+      "<span class=\"vehicle-board\"" + (boardTitle ? " title=\"" + boardTitle + "\"" : "") + ">№ " + escapeHtml(v.boardNumber) + "</span> | " +
       "<span class=\"vehicle-plate\">" + escapeHtml(v.licensePlate) + "</span> | " +
       "<span class=\"vehicle-model\">" + escapeHtml(v.model) + "</span>" +
       (v.isLowFloor ? " | <span class=\"vehicle-accessibility\" title=\"Низька підлога\">♿</span>" : "") +
@@ -1631,16 +1635,19 @@ const CLIENT_JS = String.raw`
     var rows = visible.map(function (item) {
       var key = dir.key + "|" + item.tripId + "|" + item.depAbs;
       var open = !!openTrips[key];
+      var veh = liveVehicleFor(item);
+      var dist = veh && typeof veh.distanceM === "number" ? veh.distanceM : null;
+      var distHtml = dist === null ? "—" : (dist >= 1000 ? (dist / 1000).toFixed(1) + " км" : dist + " м");
       return "<div class=\"departure-item-wrapper\">" +
         "<div class=\"departure-row\" data-trip=\"" + escapeHtml(key) + "\">" +
           "<div class=\"route-cell\"><span class=\"" + routeCls + "\">" + escapeHtml(item.route) + "</span>" +
             "<span class=\"destination-name\">" + escapeHtml(item.destination) + "</span></div>" +
-          "<div class=\"distance-cell\" title=\"По прямій від поточної позиції транспорту\">" + escapeHtml(distanceText(item)) + "</div>" +
+          "<div class=\"distance-cell\" title=\"По прямій від поточної позиції транспорту\">" + distHtml + "</div>" +
           "<div class=\"time-cell\"><span class=\"time-scheduled\">" + escapeHtml(item.time) + "</span></div>" +
           minutesHtml(item.remainingMinutes) +
         "</div>" +
         "<div class=\"trip-timeline-panel\" style=\"display:" + (open ? "block" : "none") + ";\">" +
-          vehicleBar(item.vehicle) +
+          vehicleBar(veh) +
           "<div class=\"timeline-track\">" + timelineHtml(item.stops) + "</div>" +
         "</div>" +
       "</div>";
@@ -1724,6 +1731,9 @@ const CLIENT_JS = String.raw`
           hideStatus();
         }
         renderAll();
+        // New departure data arrived (with fresh routeIds) — rejoin the live
+        // GPS feed immediately instead of waiting for the next 30 s tick.
+        refreshLive();
       })
       .catch(function (err) {
         if (seq !== hubSeq) return;
@@ -1818,6 +1828,202 @@ const CLIENT_JS = String.raw`
     if (!e.target.closest(".search-bar-wrapper")) searchDropdown.style.display = "none";
   });
 
+  /* ---------- client-side realtime (direct GPS fetch) ---------- */
+  /* The municipal RT feed (plain HTTP) answers Access-Control-Allow-Origin: *,
+   * so on an http:// page the visitor's browser can fetch it directly from a
+   * residential IP — the Cloudflare edge is 403-blocked by the origin. On an
+   * https:// page the browser blocks the mixed-content request and we fall
+   * back to /api/live (works in wrangler dev, degraded on prod). */
+  var RT_URL = "http://193.23.225.214:732/api/realtime";
+  var RT_INTERVAL_MS = 30000;
+  // Small diagnostics surface (visible via window.__RT in the console).
+  window.__RT = { applied: -1, direct: null, parsed: -1 };
+  var rtByTrip = {};
+  var rtByRoute = {};
+  var vehRegistry = null;
+
+  function pbWalk(u8, cb) {
+    var i = 0;
+    while (i < u8.length) {
+      var key = 0, shift = 0, b;
+      do { b = u8[i++]; key |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
+      var field = key >>> 3, wire = key & 7;
+      if (wire === 0) {
+        var v = 0, sh = 0;
+        do { b = u8[i++]; v |= (b & 0x7f) << sh; sh += 7; } while (b & 0x80);
+        cb(field, "varint", v);
+      } else if (wire === 1) { cb(field, "fixed64", u8.subarray(i, i + 8)); i += 8; }
+      else if (wire === 2) {
+        var len = 0; sh = 0;
+        do { b = u8[i++]; len |= (b & 0x7f) << sh; sh += 7; } while (b & 0x80);
+        cb(field, "bytes", u8.subarray(i, i + len)); i += len;
+      } else if (wire === 5) { cb(field, "fixed32", u8.subarray(i, i + 4)); i += 4; }
+      else break;
+    }
+  }
+
+  function pbF32(u8) {
+    return new DataView(u8.buffer, u8.byteOffset, u8.byteLength).getFloat32(0, true);
+  }
+
+  function decodeBytes(u8) {
+    try { return new TextDecoder("utf-8").decode(u8); } catch (e) { return ""; }
+  }
+
+  function parseRtFeed(u8) {
+    var out = [];
+    pbWalk(u8, function (f, t, v) {
+      if (f !== 2 || t !== "bytes") return;
+      pbWalk(v, function (f2, t2, v2) {
+        if (f2 !== 4 || t2 !== "bytes") return;
+        var veh = {};
+        pbWalk(v2, function (f3, t3, v3) {
+          if (f3 === 1 && t3 === "bytes") {
+            pbWalk(v3, function (f4, t4, v4) {
+              if (f4 === 1 && t4 === "bytes") veh.tripId = decodeBytes(v4);
+              if (f4 === 5 && t4 === "bytes") veh.routeId = decodeBytes(v4);
+              if (f4 === 6 && t4 === "varint") veh.directionId = v4;
+            });
+          } else if (f3 === 2 && t3 === "bytes") {
+            pbWalk(v3, function (f4, t4, v4) {
+              if (f4 === 1 && t4 === "fixed32") veh.lat = pbF32(v4);
+              if (f4 === 2 && t4 === "fixed32") veh.lon = pbF32(v4);
+              if (f4 === 3 && t4 === "fixed32") veh.bearing = pbF32(v4);
+            });
+          } else if (f3 === 5 && t3 === "varint") {
+            veh.timestamp = v3;
+          } else if (f3 === 8 && t3 === "bytes") {
+            pbWalk(v3, function (f4, t4, v4) {
+              if (f4 === 1 && t4 === "bytes") veh.vehicleId = decodeBytes(v4);
+              if (f4 === 2 && t4 === "bytes") veh.label = decodeBytes(v4);
+              if (f4 === 3 && t4 === "bytes") veh.licensePlate = decodeBytes(v4);
+            });
+          }
+        });
+        if (veh.tripId || veh.routeId) out.push(veh);
+      });
+    });
+    return out;
+  }
+
+  var registryPromise = null;
+
+  function fetchWithTimeout(url, ms) {
+    var ctrl = new AbortController();
+    var timer = setTimeout(function () { try { ctrl.abort(); } catch (e) { /* ignore */ } }, ms);
+    return fetch(url, { signal: ctrl.signal }).then(
+      function (res) { clearTimeout(timer); return res; },
+      function (err) { clearTimeout(timer); throw err; }
+    );
+  }
+
+  /** Vehicle registry (model / low-floor). Loads once, never blocks the GPS
+   * pipeline: it is slow to answer sometimes, so it gets a short timeout and
+   * when it finally arrives the board re-renders with models filled in. */
+  function loadVehRegistry() {
+    if (registryPromise) return registryPromise;
+    var cached = null;
+    try { cached = JSON.parse(localStorage.getItem("kpt_veh_registry") || "null"); } catch (e) { /* storage blocked */ }
+    if (cached && cached.map && Date.now() - cached.t < 24 * 3600 * 1000) {
+      vehRegistry = cached.map;
+      registryPromise = Promise.resolve(vehRegistry);
+      return registryPromise;
+    }
+    registryPromise = fetchWithTimeout("/api/vehicles", 6000)
+      .then(function (res) { if (!res.ok) throw new Error("HTTP " + res.status); return res.json(); })
+      .then(function (map) {
+        vehRegistry = map || {};
+        try { localStorage.setItem("kpt_veh_registry", JSON.stringify({ t: Date.now(), map: vehRegistry })); } catch (e) { /* storage blocked */ }
+        return vehRegistry;
+      })
+      .catch(function () { return {}; });
+    return registryPromise;
+  }
+
+  function distMeters(lat1, lon1, lat2, lon2) {
+    var dLat = (lat2 - lat1) * 111320;
+    var dLon = (lon2 - lon1) * 111320 * Math.cos((lat1 + lat2) / 2 * Math.PI / 180);
+    return Math.hypot(dLat, dLon);
+  }
+
+  /** Live vehicle for a departure. The municipal feed carries no trip_id, so
+   * exact trip matching is a fallback; the primary join is by route_id with
+   * the vehicle closest to the stop. Both are real GPS positions — nothing
+   * is invented, and an unmatched trip keeps its honest dashes. */
+  function liveVehicleFor(item) {
+    var veh = null;
+    var exact = rtByTrip[item.tripId];
+    if (exact) {
+      veh = exact;
+      veh.matched = "trip";
+    } else {
+      var cands = rtByRoute[item.routeId] || [];
+      var pos = item.originPos;
+      var best = null, bestD = Infinity;
+      cands.forEach(function (v) {
+        if (typeof v.lat !== "number" || !Number.isFinite(v.lat)) return;
+        if (!pos || !Number.isFinite(pos[0]) || !Number.isFinite(pos[1])) return;
+        var d = distMeters(v.lat, v.lon, pos[0], pos[1]);
+        if (d < bestD) { best = v; bestD = d; }
+      });
+      if (!best) return item.vehicle || null;
+      best.matched = "route";
+      veh = best;
+    }
+    var digits = String(veh.licensePlate || veh.label || "").match(/\d{3,}/);
+    var reg = (digits && vehRegistry) ? vehRegistry[digits[0]] : null;
+    var pos2 = item.originPos;
+    var hasPos = typeof veh.lat === "number" && Number.isFinite(veh.lat) && pos2 && Number.isFinite(pos2[0]) && Number.isFinite(pos2[1]);
+    return {
+      boardNumber: veh.licensePlate || veh.label || "—",
+      licensePlate: (veh.label && veh.label !== veh.licensePlate) ? veh.label : "—",
+      model: reg ? reg.model : "—",
+      isLowFloor: reg ? !!reg.lowFloor : false,
+      matched: veh.matched,
+      distanceM: hasPos ? Math.round(distMeters(veh.lat, veh.lon, pos2[0], pos2[1])) : null
+    };
+  }
+
+  function refreshLive() {
+    var apply = function (vehicles) {
+      window.__RT = { applied: (vehicles || []).length, t: Date.now() };
+      rtByTrip = {};
+      rtByRoute = {};
+      (vehicles || []).forEach(function (v) {
+        if (v.tripId && !rtByTrip[v.tripId]) rtByTrip[v.tripId] = v;
+        if (v.routeId) {
+          if (!rtByRoute[v.routeId]) rtByRoute[v.routeId] = [];
+          rtByRoute[v.routeId].push(v);
+        }
+      });
+      if (currentHub && currentHub.directions) renderGrid();
+    };
+    var serverFallback = function () {
+      return fetchWithTimeout("/api/live", 8000)
+        .then(function (res) { return res.ok ? res.json() : []; })
+        .then(function (d) { return d.vehicles || []; })
+        .catch(function () { return []; });
+    };
+    // The GPS feed must never wait for the registry: they load in parallel,
+    // and the registry re-renders the board once it finally resolves.
+    var rt = fetch(RT_URL)
+      .then(function (res) {
+        window.__RT.direct = res.status;
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        return res.arrayBuffer();
+      })
+      .then(function (buf) {
+        var parsed = parseRtFeed(new Uint8Array(buf));
+        window.__RT.parsed = parsed.length;
+        return parsed;
+      })
+      .catch(serverFallback);
+    loadVehRegistry().then(function () {
+      if ((Object.keys(rtByRoute).length || Object.keys(rtByTrip).length) && currentHub && currentHub.directions) renderGrid();
+    }).catch(function () { /* registry is optional */ });
+    return rt.then(apply);
+  }
+
   /* ---------- board interactions (event delegation) ---------- */
   departureGrid.addEventListener("click", function (e) {
     var stopEl = e.target.closest("[data-stop]");
@@ -1857,6 +2063,11 @@ const CLIENT_JS = String.raw`
   /* ---------- boot ---------- */
   clockFormatter = makeClockFormatter();
   setInterval(updateClock, 10000);
+  refreshLive();
+  setInterval(refreshLive, RT_INTERVAL_MS);
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden) refreshLive();
+  });
 
   setInterval(function () {
     if (!document.hidden) loadHub(currentStop, true);
@@ -1990,6 +2201,13 @@ export default {
       if (pathname === "/api/live") {
         const vehicles = await loadRealtime();
         return json({ vehicles, timestamp: new Date().toISOString() });
+      }
+
+      // 4b. Vehicle registry (brand/model/low-floor per board number) — for the
+      //     client-side realtime join. Served from the edge-cached portal data.
+      if (pathname === "/api/vehicles") {
+        const registry = await loadVehicleIndex().catch(() => ({}));
+        return json(registry || {});
       }
 
       // 5. Source reachability probe (admin only — makes ~28 outbound requests)
