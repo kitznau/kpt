@@ -9,6 +9,18 @@
  *  2. GTFS Realtime (АСКДУ)            — live vehicle positions (protobuf)
  *  3. Vehicle registry (open data)     — brand / model / low-floor by board number
  *  4. ІАС «Майно» stop registry        — metro, funicular, city express, street names
+ *  5. «Київ Digital» app API (kyiv.digital) — realtime #2: departure predictions
+ *     + live GPS (official municipal app API, Bearer token in env.KD_TOKEN)
+ *
+ * Changelog 3.2.0 (adds source 5)
+ *  - KD predictions: stops-tablo forecasts ("N хв") attached to matching GTFS
+ *    rows (±3 min) and shown as "≈N" chips; routes with forecasts but no GTFS
+ *    rows get their own KD-only cards (marked "за прогнозом Київ Digital").
+ *  - KD GPS: live vehicles per route, geofenced (the feed has garbage points),
+ *    merged into the client fallback chain as hub.kdLive.
+ *  - assets/kd-index.json: static route/stop mapping built by build-kd-index.mjs
+ *    (one batched tablo + one batched gps call per hub per 30 s — API limits are
+ *    10/window for both realtime endpoints; all calls edge-cached).
  *
  * Changelog 3.1.0 (fixes over 3.0)
  *  HANG FIXES
@@ -38,7 +50,7 @@
  * (rebuild it with build-index.mjs and redeploy).
  */
 
-const VERSION = "3.1.0";
+const VERSION = "3.2.0";
 
 const CONFIG = {
   TIMEZONE: "Europe/Kyiv",
@@ -58,6 +70,18 @@ const CONFIG = {
   REALTIME_TTL_SEC: 30,
   HUB_TTL_SEC: 60,
   NEGATIVE_TTL_SEC: 120,          // failed auxiliary loads are not retried for this long
+
+  // «Київ Digital» app API (source 5). Realtime endpoints allow 10 calls per
+  // ~30-60 s window, so every answer is edge-cached for KD_*_TTL_SEC and the
+  // per-stop/route ids are batched into ONE call each.
+  KD_BASE: "https://kyiv.digital",
+  KD_TABLO_TTL_SEC: 30,
+  KD_GPS_TTL_SEC: 30,
+  KD_TIMEOUT_MS: 5000,
+  KD_GPS_ROUTES_CAP: 10,          // hard API limit per request
+  KD_STOP_MATCH_RADIUS_M: 150,    // GTFS stop -> KD stop coordinate match
+  KD_MATCH_TOLERANCE_MIN: 3,      // row attach: |schedule - forecast| tolerance
+  KD_AVG_SPEED_M_PER_MIN: 300,    // straight-line speed for vehicle<->forecast pairing
 
   // Time budgets (ms) — nothing on the request path may exceed these.
   SSR_BUDGET_MS: 5000,
@@ -79,7 +103,7 @@ const CONFIG = {
   TIMELINE_STOPS_LIMIT: 8,
   PAGE_REFRESH_SEC: 30,
 
-  USER_AGENT: "KPT-Departure-Monitor/3.1 (Kyiv City Open Data Engine)",
+  USER_AGENT: "KPT-Departure-Monitor/3.2 (Kyiv City Open Data Engine)",
 
   // The municipal feeds (193.23.225.x) answer 403 to cloud-provider IPs.
   // Public relays are used only as fallback paths (same official URLs, relayed).
@@ -858,6 +882,257 @@ const ROUTE_TYPE_LABELS = { 0: "ТРАМ", 11: "ТРОЛ", 3: "АВТ", 1: "МЕ
 const STOP_MODE_LABELS = { "1": "ТРАМ", "2": "ТРОЛ", "3": "АВТ" };
 
 /* ============================================================
+ * SOURCE 5: «КИЇВ DIGITAL» APP API (kyiv.digital) — realtime #2
+ *
+ * Official API of the municipal «Київ Digital» mobile app. Auth is a Bearer
+ * JWT in env.KD_TOKEN (secret; .dev.vars locally). Realtime endpoints allow
+ * 10 calls per ~30-60 s window, therefore:
+ *   - stop -> KD-stop matching is served from the bundled assets/kd-index.json
+ *     (static mapping, built by build-kd-index.mjs, zero API calls);
+ *   - predictions (stops-tablo) and GPS are ONE batched call each per hub,
+ *     edge-cached 30 s via cachedJson (identical id sets share the cache).
+ *
+ * Formats (verified against the live API):
+ *   stops-tablo: { aId: { kdRouteId: { times: ["52 хв" | "", ...] } } }
+ *     times = one STRING forecast per approaching vehicle; "" = none.
+ *   gps:         { kdRouteId: { vehNum: { lat, lng, bearing, label,
+ *                              timestamp(sec), ... } } }
+ *     label = board number; the feed contains garbage coordinates (e.g. Lima)
+ *     -> kdInKyiv() geofence is mandatory.
+ * ============================================================ */
+
+const KD_INDEX_ASSET_URL = "https://assets.internal/kd-index.json";
+const KD_CALL_BASE = "https://kpt-cache.internal/kd/";
+let kdIndexMemo = null;
+let kdIndexMemoAt = 0;
+
+function kdIndexLooksValid(d) {
+  return !!(d && d.routes && Array.isArray(d.stops) &&
+    d.stops.length >= 1000 && Object.keys(d.routes).length >= 100);
+}
+
+/** Bundled kd-index.json asset — static mapping, available in every colo. */
+async function readKdAsset(env) {
+  try {
+    if (!env || !env.ASSETS) return null;
+    const res = await env.ASSETS.fetch(new Request(KD_INDEX_ASSET_URL));
+    if (!res.ok) return null;
+    const data = await res.json();
+    return kdIndexLooksValid(data) ? data : null;
+  } catch (err) {
+    console.error("kd asset read failed:", (err && err.message) || err);
+    return null;
+  }
+}
+
+/** memo (10 min) -> bundled asset. No edge-cache layer on purpose: the asset
+ *  is already shipped to every colo by the deploy, and an envelope cached
+ *  before a deploy would serve the stale mapping for up to a day. */
+async function loadKdIndex(env) {
+  if (kdIndexMemo && Date.now() - kdIndexMemoAt < 600000) return kdIndexMemo;
+  const asset = await readKdAsset(env);
+  if (asset) {
+    kdIndexMemo = asset;
+    kdIndexMemoAt = Date.now();
+    return asset;
+  }
+  return null;
+}
+
+function kdAuthToken(env) {
+  return (env && typeof env.KD_TOKEN === "string" && env.KD_TOKEN.length > 40) ? env.KD_TOKEN : null;
+}
+
+async function kdFetchJson(env, path) {
+  const token = kdAuthToken(env);
+  if (!token) throw new Error("KD_TOKEN not set");
+  const res = await fetch(CONFIG.KD_BASE + path, {
+    headers: { "Authorization": "Bearer " + token, "Accept": "application/json", "User-Agent": "KD/4.1.0 Android/16 KPT-Departure-Monitor" },
+    signal: AbortSignal.timeout(CONFIG.KD_TIMEOUT_MS)
+  });
+  if (!res.ok) throw new Error("KD HTTP " + res.status + " " + path);
+  return res.json();
+}
+
+/** Batched predictions per stop (API limit: 10 ids/request), cached 30 s. */
+function kdTablo(env, aIds) {
+  const ids = [...new Set(aIds)].sort().slice(0, 10);
+  if (!ids.length) return Promise.resolve({});
+  return cachedJson(KD_CALL_BASE + "tablo/" + ids.join(","), CONFIG.KD_TABLO_TTL_SEC,
+    () => kdFetchJson(env, "/api/transport/routes/stops-tablo?stopIds=" + ids.join(",")), {});
+}
+
+/** Batched GPS per route (API limit: 10 ids/request), cached 30 s. */
+function kdGps(env, routeIds) {
+  const ids = [...new Set(routeIds)].sort().slice(0, 10);
+  if (!ids.length) return Promise.resolve({});
+  return cachedJson(KD_CALL_BASE + "gps/" + ids.join(","), CONFIG.KD_GPS_TTL_SEC,
+    () => kdFetchJson(env, "/api/transport/routes/gps?routeIds=" + ids.join(",")), {});
+}
+
+/** Sanity geofence: the GPS feed sometimes emits far-away garbage points. */
+function kdInKyiv(lat, lng) {
+  return lat > 49.2 && lat < 52.4 && lng > 28.5 && lng < 33.5;
+}
+
+/** "52 хв" -> 52; "" / unknown shape -> null (the UI shows an honest dash). */
+function kdParseMinutes(s) {
+  const m = /^(\d+)\s*хв/.exec(String(s || "").trim());
+  const n = m ? parseInt(m[1], 10) : NaN;
+  return Number.isFinite(n) ? n : null;
+}
+
+/* ---------- full-stop timeline (fixes the control-points-only GTFS feed) ----------
+ * The official GTFS export lists only CONTROL POINTS per trip (max 8 stops,
+ * avg 4.2), so a raw GTFS timeline is unavoidably incomplete. The KD route
+ * directions (bundled asset, no API calls) carry EVERY stop of the line in
+ * order. Timeline = KD stop list; official times appear only at the GTFS
+ * control points, the rest get an honest "—". */
+
+const KD_TIMELINE_MATCH_RADIUS_M = 250;
+const KD_TIMELINE_MAX_ROWS = 60;
+
+/** Direction path (array of [aId, name, lat, lng]) of a route whose terminus
+ *  best matches the destination name, or null. */
+function kdPathForDestination(kd, routeNumber, destName) {
+  const dtoks = new Set(normalizeName(destName).match(/[а-яіїєґa-z0-9]+/g) || []);
+  let best = null, bestScore = 0;
+  for (const [kdId, meta] of Object.entries(kd.routes)) {
+    if (String(meta[0]) !== String(routeNumber)) continue;
+    const p = kd.paths && kd.paths[kdId];
+    if (!p) continue;
+    for (const key of ["f", "b"]) {
+      const path = p[key];
+      if (!path || path.length < 2) continue;
+      const etoks = normalizeName(path[path.length - 1][1]).match(/[а-яіїєґa-z0-9]+/g) || [];
+      let score = 0;
+      for (const t of etoks) if (dtoks.has(t)) score++;
+      if (score > bestScore) { bestScore = score; best = path; }
+    }
+  }
+  return best;
+}
+
+/** Of the two directions of one KD route, the one whose terminus best matches
+ *  the destination (fallback: forward, else backward). */
+function kdPickDirection(p, destName) {
+  const dtoks = new Set(normalizeName(destName || "").match(/[а-яіїєґa-z0-9]+/g) || []);
+  let best = null, bestScore = 0;
+  for (const key of ["f", "b"]) {
+    const path = p[key];
+    if (!path || path.length < 2) continue;
+    const etoks = normalizeName(path[path.length - 1][1]).match(/[а-яіїєґa-z0-9]+/g) || [];
+    let score = 0;
+    for (const t of etoks) if (dtoks.has(t)) score++;
+    if (score > bestScore) { bestScore = score; best = path; }
+  }
+  return best || p.f || p.b || null;
+}
+
+function kdNearestPathIdx(path, lat, lng, maxDistM) {  let best = -1, bd = maxDistM;
+  for (let i = 0; i < path.length; i++) {
+    const d = distanceMeters(lat, lng, path[i][2], path[i][3]);
+    if (d < bd) { bd = d; best = i; }
+  }
+  return best;
+}
+
+/**
+ * Full timeline for one trip: GTFS control points (with official times) laid
+ * over the complete KD direction path. Returns [{name, time, status}] or null
+ * (caller keeps the raw GTFS timeline then — honest fallback).
+ */
+function kdBuildTimeline(path, seq, stopPosById, stopNameById) {
+  try {
+    if (!path || path.length < 2 || !seq || seq.length < 2) return null;
+    const cps = [];
+    for (const entry of seq) {
+      const pos = stopPosById[entry[0]];
+      if (!pos) return null;
+      const idx = kdNearestPathIdx(path, pos[0], pos[1], KD_TIMELINE_MATCH_RADIUS_M);
+      cps.push({ stopId: entry[0], dep: entry[1], idx, time: formatGtfsTime(entry[1]), matched: idx >= 0 });
+    }
+    // Control points follow the path order; a decrease means a mismatched
+    // direction — keep the raw GTFS timeline instead of a wrong one.
+    for (let i = 1; i < cps.length; i++) {
+      if (cps[i].matched && cps[i - 1].matched && cps[i].idx < cps[i - 1].idx) return null;
+    }
+    const first = cps[0], last = cps[cps.length - 1];
+    if (!first.matched || !last.matched || last.idx <= first.idx) return null;
+
+    // Unmatched control points keep their time and are interpolated between
+    // their matched neighbours (by departure time).
+    for (let ci = 0; ci < cps.length; ci++) {
+      const cp = cps[ci];
+      if (cp.matched) continue;
+      let prevMatched = null, nextMatched = null;
+      for (let cj = ci - 1; cj >= 0; cj--) { if (cps[cj].matched) { prevMatched = cps[cj]; break; } }
+      for (let cj = ci + 1; cj < cps.length; cj++) { if (cps[cj].matched) { nextMatched = cps[cj]; break; } }
+      if (prevMatched && nextMatched && nextMatched.dep > prevMatched.dep) {
+        const f = (cp.dep - prevMatched.dep) / (nextMatched.dep - prevMatched.dep);
+        cp.sortIdx = prevMatched.idx + f * (nextMatched.idx - prevMatched.idx);
+      } else if (prevMatched) {
+        cp.sortIdx = prevMatched.idx;
+      } else if (nextMatched) {
+        cp.sortIdx = nextMatched.idx;
+      } else {
+        cp.sortIdx = first.idx;
+      }
+      cp.sortIdx = Math.max(first.idx, Math.min(last.idx, cp.sortIdx));
+    }
+
+    const unmatched = cps.filter(c => !c.matched).sort((a, b) => a.dep - b.dep);
+    const rows = [];
+    const startI = Math.round(first.idx), endI = Math.round(last.idx);
+    for (let i = startI; i <= endI; i++) {
+      while (unmatched.length && unmatched[0].sortIdx <= i - 0.5) {
+        const cp = unmatched.shift();
+        rows.push({ name: stopNameById[cp.stopId] || cp.stopId, time: cp.time, status: "intermediate" });
+      }
+      const here = cps.filter(c => c.matched && Math.round(c.idx) === i).sort((a, b) => a.dep - b.dep);
+      rows.push({ name: path[i][1], time: here.length ? here[0].time : null, status: "intermediate" });
+      if (here.length > 1) {
+        for (const cp of here.slice(1)) {
+          rows.push({ name: stopNameById[cp.stopId] || cp.stopId, time: cp.time, status: "intermediate" });
+        }
+      }
+    }
+    while (unmatched.length) {
+      const cp = unmatched.shift();
+      rows.push({ name: stopNameById[cp.stopId] || cp.stopId, time: cp.time, status: "intermediate" });
+    }
+    if (rows.length < 2) return null;
+    rows[0].status = "current";
+    rows[rows.length - 1].status = "destination";
+    return rows.slice(0, KD_TIMELINE_MAX_ROWS);
+  } catch (err) {
+    console.error("kdBuildTimeline failed:", (err && err.message) || err);
+    return null;
+  }
+}
+
+/** Replaces every departure's control-points-only timeline with the full stop
+ *  list of the line. Works from the bundled asset only — no KD_TOKEN needed. */
+function enrichTimelinesFromKd(kd, hub, index, stopPosById, stopNameById) {
+  if (!kd.paths || !hub.directions) return;
+  for (const dir of hub.directions) {
+    const rows0 = dir.departures && dir.departures[0];
+    if (!rows0) continue;
+
+    if (dir.kdOnly) continue; // KD-only timelines are attached at creation time (see below)
+
+    const path = kdPathForDestination(kd, dir.departures[0].route, dir.departures[0].destination);
+    if (!path) continue;
+    for (const d of dir.departures) {
+      const seq = index && index.tripStops && index.tripStops[d.tripId];
+      if (!seq) continue;
+      const full = kdBuildTimeline(path, seq, stopPosById, stopNameById);
+      if (full) d.stops = full;
+    }
+  }
+}
+
+/* ============================================================
  * HUB RESOLVER — official schedule board for any stop
  * ============================================================ */
 
@@ -924,18 +1199,31 @@ function hubMemoSet(key, hub) {
   hubMemo.set(key, { hub, until: Date.now() + CONFIG.HUB_TTL_SEC * 1000 });
 }
 
-/** Non-mutating: re-derives remaining minutes of a (possibly cached) hub and drops departed trips. */
+/** Non-mutating: re-derives remaining minutes of a (possibly cached) hub and drops departed trips.
+ *  KD forecasts (row-level kdMinutes / card-level kdPredictions) are decremented
+ *  by the elapsed minutes the same way — they are ages, not absolute times. */
 function refreshHubTimes(hub) {
   const out = { ...hub, kyivTime: kyivTimeString() };
   if (!hub.directions || !hub.builtAtMs) return out;
-  const nowRel = (hub.nowSecAtBuild || 0) + (Date.now() - hub.builtAtMs) / 1000;
+  const elapsedMin = (Date.now() - hub.builtAtMs) / 60000;
+  const nowRel = (hub.nowSecAtBuild || 0) + elapsedMin * 60;
   out.directions = hub.directions
-    .map(dir => ({
-      ...dir,
-      departures: (dir.departures || [])
+    .map(dir => {
+      const next = { ...dir };
+      if (Array.isArray(dir.kdPredictions)) {
+        next.kdPredictions = dir.kdPredictions
+          .map(m => Math.round(m - elapsedMin))
+          .filter(m => m > 0);
+      }
+      next.departures = (dir.departures || [])
         .filter(d => d.depAbs >= nowRel - 60)
-        .map(d => ({ ...d, remainingMinutes: Math.max(0, Math.round((d.depAbs - nowRel) / 60)) }))
-    }))
+        .map(d => {
+          const nd = { ...d, remainingMinutes: Math.max(0, Math.round((d.depAbs - nowRel) / 60)) };
+          if (typeof d.kdMinutes === "number") nd.kdMinutes = Math.max(0, Math.round(d.kdMinutes - elapsedMin));
+          return nd;
+        });
+      return next;
+    })
     .filter(dir => dir.departures.length > 0);
   return out;
 }
@@ -1060,7 +1348,7 @@ async function buildHub(hubKey, ctx, env) {
     return g;
   });
 
-  return {
+  const hub = {
     hubKey: target.stopIds[0],
     title: "Київ, " + target.title,
     stopName: target.title,
@@ -1071,6 +1359,242 @@ async function buildHub(hubKey, ctx, env) {
     builtAtMs: Date.now(),
     nowSecAtBuild: nowSec
   };
+
+  // Source 5: KD predictions / KD-only cards / KD GPS. Best effort — a KD
+  // outage or missing KD_TOKEN must never fail the official schedule board.
+  await enrichHubWithKd(hub, target, stopPosById, stopNameById, index, ctx, env);
+
+  return hub;
+}
+
+/**
+ * KD enrichment of a built hub (mutates `hub`):
+ *  1. GTFS platforms of the hub are matched to KD stops by coordinates;
+ *  2. ONE batched stops-tablo call (cached 30 s) -> forecasts per route number;
+ *  3. a forecast within ±KD_MATCH_TOLERANCE_MIN of a GTFS row marks that row
+ *     with kdMinutes (client renders "≈N'" with a tooltip);
+ *  4. tracked routes with forecasts but NO GTFS rows get KD-only cards
+ *     (routeId "kd:<id>" so the client's one-vehicle-one-trip matcher can
+ *     attach the KD GPS vehicles to them);
+ *  5. ONE batched gps call (cached 30 s, cap 10 routes) -> hub.kdLive in the
+ *     client vehicle format, geofenced; vehicles are also paired with the
+ *     KD-only rows server-side (|eta - forecast| <= 5 min, one-to-one).
+ */
+async function enrichHubWithKd(hub, target, stopPosById, stopNameById, index, ctx = null, env = null) {
+  try {
+    const kd = await loadKdIndex(env);
+    if (!kd) return;
+    const nowSec = hub.nowSecAtBuild;
+
+    // Timeline completion runs before the token gate: it works from the
+    // bundled asset alone (public static mapping), zero KD API calls.
+    enrichTimelinesFromKd(kd, hub, index, stopPosById, stopNameById);
+
+    if (!kdAuthToken(env)) return;
+
+    // 1) coordinate match GTFS platform -> KD stop (the registries differ)
+    const aIds = [];
+    const seenA = new Set();
+    for (const stopId of target.stopIds) {
+      const pos = stopPosById[stopId];
+      if (!pos || !Number.isFinite(pos[0])) continue;
+      let best = null, bestD = Infinity;
+      for (const s of kd.stops) {
+        const d = distanceMeters(pos[0], pos[1], s[2], s[3]);
+        if (d < bestD) { bestD = d; best = s; }
+      }
+      if (best && bestD <= CONFIG.KD_STOP_MATCH_RADIUS_M && !seenA.has(best[0])) {
+        seenA.add(best[0]);
+        aIds.push(best[0]);
+      }
+    }
+    if (!aIds.length) return;
+
+    // 2) forecasts: one batched call
+    const tablo = await withDeadline(kdTablo(env, aIds), CONFIG.KD_TIMEOUT_MS + 500, {});
+    const predsByNumber = {}; // number -> [{kdId, minutes: [..]}]
+    const kdIds = new Set();
+    for (const aId of Object.keys(tablo || {})) {
+      for (const kdId of Object.keys(tablo[aId] || {})) {
+        const meta = kd.routes[kdId];
+        if (!meta) continue;
+        const minutes = (((tablo[aId][kdId] || {}).times) || [])
+          .map(kdParseMinutes).filter(v => v !== null).sort((a, b) => a - b);
+        if (!minutes.length) continue;
+        kdIds.add(kdId);
+        (predsByNumber[meta[0]] ||= []).push({ kdId, minutes });
+      }
+    }
+    if (!kdIds.size) return;
+
+    // 3) row-level attach + forecast chips on schedule cards
+    const numbersInHub = new Set();
+    for (const dir of hub.directions) {
+      const num = dir.departures[0] ? String(dir.departures[0].route) : null;
+      const list = num ? predsByNumber[num] : null;
+      if (list) {
+        const flat = [...new Set(list.flatMap(p => p.minutes))].sort((a, b) => a - b);
+        if (flat.length) dir.kdPredictions = flat;
+      }
+      for (const d of dir.departures) {
+        numbersInHub.add(String(d.route));
+        const plist = predsByNumber[String(d.route)];
+        if (!plist) continue;
+        for (const p of plist) {
+          const hit = p.minutes.find(m => Math.abs(m - d.remainingMinutes) <= CONFIG.KD_MATCH_TOLERANCE_MIN);
+          if (hit !== undefined) { d.kdMinutes = hit; break; }
+        }
+      }
+    }
+
+    // 4) KD-only cards for numbers the schedule board does not show
+    const originPos = stopPosById[target.stopIds[0]] || null;
+    const kdOnlyPaths = {}; // kdId -> {path, rows} for the "current" GPS mark
+    for (const [num, list] of Object.entries(predsByNumber)) {
+      if (numbersInHub.has(num)) continue;
+      for (const p of list) {
+        const meta = kd.routes[p.kdId] || [num, 3, num];
+        const type = ROUTE_TYPE_LABELS[meta[1]] || "ТРАНЗ";
+        // timeline: full line path from the asset; times are not published for
+        // these routes (the app shows countdowns only) — honest dashes
+        let kdRows = null, kdPath = null;
+        const pp = kd.paths[p.kdId];
+        if (pp) {
+          kdPath = kdPickDirection(pp, meta[2]);
+          if (kdPath) {
+            kdRows = kdPath.map((s, i) => ({ name: s[1], time: null, status: i === kdPath.length - 1 ? "destination" : "intermediate" }));
+          }
+        }
+        hub.directions.push({
+          id: "kd-" + p.kdId,
+          key: "kd:" + p.kdId,
+          title: "ПЛАТФОРМА · " + type + " (ЗА ПРОГНОЗОМ КИЇВ DIGITAL: " + String(meta[2]).toUpperCase() + ")",
+          type,
+          typeKey: meta[1],
+          kdOnly: true,
+          kdPredictions: p.minutes,
+          departures: p.minutes.map((m, i) => ({
+            tripId: "kd" + p.kdId + "-" + i,
+            routeId: "kd:" + p.kdId,
+            route: num,
+            destination: meta[2],
+            time: "≈" + formatGtfsTime(nowSec + m * 60),
+            depAbs: nowSec + m * 60,
+            originPos,
+            delayMin: 0,
+            remainingMinutes: m,
+            kdMinutes: m,
+            kdOnly: true,
+            vehicle: null,
+            stops: kdRows ? kdRows.map(r => ({ ...r })) : []
+          }))
+        });
+        if (kdPath && kdRows) kdOnlyPaths[p.kdId] = { path: kdPath, rows: kdRows };
+      }
+    }
+
+    // 5) GPS: one batched call for the routes with forecasts (cap = API limit)
+    const gpsIds = [...kdIds].sort((a, b) => a - b).slice(0, CONFIG.KD_GPS_ROUTES_CAP);
+    const gps = await withDeadline(kdGps(env, gpsIds), CONFIG.KD_TIMEOUT_MS + 500, {});
+    const kdLive = [];
+    const dirsByNumber = {};
+    for (const dir of hub.directions) {
+      if (dir.kdOnly) continue;
+      const num = dir.departures[0] ? String(dir.departures[0].route) : null;
+      if (num) (dirsByNumber[num] ||= []).push(dir);
+    }
+
+    for (const kdId of gpsIds) {
+      const meta = kd.routes[kdId] || [];
+      const num = String(meta[0] || "");
+      // KD vehicles compete with the municipal RT feed on schedule cards only
+      // when the direction is reasonably identified; otherwise they keep the
+      // "kd:<id>" routeId and serve the KD-only cards.
+      let routeId = "kd:" + kdId;
+      const dirs = dirsByNumber[num] || [];
+      if (dirs.length === 1) {
+        routeId = dirs[0].departures[0].routeId;
+      } else if (dirs.length > 1) {
+        const dest = String(meta[2] || "").toLowerCase();
+        const toks = dest.match(/[а-яіїєґa-z0-9]+/g) || [];
+        let bestDir = null, bestScore = 0;
+        for (const dir of dirs) {
+          const dn = String((dir.departures[0] && dir.departures[0].destination) || "").toLowerCase();
+          const dtoks = new Set(dn.match(/[а-яіїєґa-z0-9]+/g) || []);
+          const score = toks.filter(t => dtoks.has(t)).length;
+          if (score > bestScore) { bestScore = score; bestDir = dir; }
+        }
+        if (bestDir && bestScore > 0) routeId = bestDir.departures[0].routeId;
+      }
+
+      const vehs = [];
+      for (const v of Object.values(gps[kdId] || {})) {
+        if (!v || typeof v.lat !== "number" || typeof v.lng !== "number") continue;
+        if (!kdInKyiv(v.lat, v.lng)) continue;
+        vehs.push(v);
+      }
+      if (!vehs.length) continue;
+
+      for (const v of vehs) {
+        kdLive.push({
+          tripId: null,
+          routeId,
+          licensePlate: v.label || "—",
+          lat: v.lat,
+          lon: v.lng,
+          bearing: typeof v.bearing === "number" ? v.bearing : null,
+          ts: (v.timestamp || 0) * 1000
+        });
+      }
+
+      // pair vehicles with the KD-only rows (eta vs forecast, one-to-one)
+      const kdDir = hub.directions.find(d => d.key === "kd:" + kdId);
+      if (kdDir && originPos) {
+        const used = new Set();
+        for (const row of kdDir.departures) {
+          let best = null, bestDiff = Infinity;
+          vehs.forEach((v, i) => {
+            if (used.has(i)) return;
+            const eta = distanceMeters(v.lat, v.lng, originPos[0], originPos[1]) / CONFIG.KD_AVG_SPEED_M_PER_MIN;
+            const diff = Math.abs(eta - row.remainingMinutes);
+            if (diff < bestDiff) { bestDiff = diff; best = i; }
+          });
+          if (best !== null && bestDiff <= 5) {
+            used.add(best);
+            const v = vehs[best];
+            row.vehicle = {
+              boardNumber: v.label || "—",
+              licensePlate: v.label || "—",
+              model: "—",
+              isLowFloor: false,
+              matched: "route",
+              lat: v.lat,
+              lon: v.lng,
+              distanceM: Math.round(distanceMeters(v.lat, v.lng, originPos[0], originPos[1]))
+            };
+          }
+        }
+        // mark the stop nearest to the vehicle as current on the KD timeline
+        const kdInfo = kdOnlyPaths[kdId];
+        const vehRow = kdDir.departures.find(x => x.vehicle && typeof x.vehicle.lat === "number");
+        if (kdInfo && vehRow) {
+          const vi = kdNearestPathIdx(kdInfo.path, vehRow.vehicle.lat, vehRow.vehicle.lon, KD_TIMELINE_MATCH_RADIUS_M);
+          if (vi >= 0) {
+            for (const d of kdDir.departures) {
+              if (d.stops && d.stops[vi]) d.stops[vi].status = "current";
+            }
+          }
+        }
+      }
+    }
+
+    if (kdLive.length) {
+      hub.kdLive = kdLive;
+      hub.kdUsed = true;
+    }
+  } catch (err) {
+    console.error("KD enrichment failed:", (err && err.message) || err);
+  }
 }
 
 async function resolveHubDepartures(query, ctx = null, env = null) {
@@ -1508,6 +2032,11 @@ const EXTRA_CSS = `
 .notice-card { grid-column: 1 / -1; padding: 40px 20px; text-align: center; background: #161b22; border: 1px solid #30363d; border-radius: 8px; color: #8b949e; }
 .notice-card.error { color: #f85149; }
 .btn-icon:disabled { opacity: 0.6; cursor: progress; }
+/* «Київ Digital» (source 5) chips */
+.kd-chip { margin-left: 10px; font-size: 0.72rem; padding: 2px 8px; border-radius: 10px; background: rgba(63,185,80,.12); color: #3fb950; border: 1px solid rgba(63,185,80,.35); white-space: nowrap; }
+.eta-cell.kd { color: #d29922; }
+/* full-line timelines can be long — scroll inside the trip panel */
+.trip-timeline-panel .timeline-track { max-height: 65vh; overflow-y: auto; padding-right: 6px; }
 `;
 
 /* ============================================================
@@ -1546,6 +2075,7 @@ const CLIENT_JS = String.raw`
 
   var currentStop = BOOT.stop;
   var currentHub = BOOT.hub;
+  hubFetchedAtMs = Date.now();
   var expanded = {};
   var openTrips = {};
   var hubSeq = 0;
@@ -1590,10 +2120,12 @@ const CLIENT_JS = String.raw`
   function hideStatus() { statusBanner.style.display = "none"; }
 
   /* ---------- rendering ---------- */
-  function minutesHtml(m) {
-    if (m <= 0) return "<span class=\"eta-cell\" style=\"color:#3fb950\">0'</span>";
-    if (m >= 60) return "<span class=\"eta-cell hours\">" + Math.floor(m / 60) + "h " + (m % 60) + "'</span>";
-    return "<span class=\"eta-cell\">" + m + "'</span>";
+  function minutesHtml(m, kd) {
+    var approx = kd ? "≈" : "";
+    var title = kd ? " title=\"Прогноз відправлення за даними офіційного API «Київ Digital»\"" : "";
+    if (m <= 0) return "<span class=\"eta-cell\"" + title + " style=\"color:#3fb950\">" + approx + "0'</span>";
+    if (m >= 60) return "<span class=\"eta-cell hours\"" + title + ">" + approx + Math.floor(m / 60) + "h " + (m % 60) + "'</span>";
+    return "<span class=\"eta-cell" + (kd ? " kd" : "") + "\"" + title + ">" + approx + m + "'</span>";
   }
 
   function vehicleBar(veh) {
@@ -1621,7 +2153,7 @@ const CLIENT_JS = String.raw`
         "<div class=\"timeline-bullet-col\"><div class=\"timeline-dot " + dot + "\"></div></div>" +
         "<div class=\"timeline-name-col " + nameCls + " stop-clickable\" data-stop=\"" + escapeHtml(st.name) + "\" title=\"Перейти до табло зупинки: " + escapeHtml(st.name) + "\">" +
           escapeHtml(st.name) + " <span class=\"stop-nav-arrow\">↗</span></div>" +
-        "<div class=\"timeline-time-col\">" + escapeHtml(st.time) + "</div>" +
+        "<div class=\"timeline-time-col\">" + escapeHtml(st.time === null || st.time === undefined ? "—" : st.time) + "</div>" +
         "</div>";
     }).join("");
   }
@@ -1635,16 +2167,17 @@ const CLIENT_JS = String.raw`
     var rows = visible.map(function (item) {
       var key = dir.key + "|" + item.tripId + "|" + item.depAbs;
       var open = !!openTrips[key];
-      var veh = liveVehicleFor(item);
+      var veh = liveVehicleFor(item, key);
       var dist = veh && typeof veh.distanceM === "number" ? veh.distanceM : null;
       var distHtml = dist === null ? "—" : (dist >= 1000 ? (dist / 1000).toFixed(1) + " км" : dist + " м");
+      var kdCell = item.kdOnly || typeof item.kdMinutes === "number";
       return "<div class=\"departure-item-wrapper\">" +
-        "<div class=\"departure-row\" data-trip=\"" + escapeHtml(key) + "\">" +
+        "<div class=\"departure-row\" data-trip=\"" + escapeHtml(key) + "\"" + (item.kdOnly ? " title=\"Рейс за прогнозом «Київ Digital»: у офіційному розкладі КП «Київпастранс» на цей час рейсу немає\"" : "") + ">" +
           "<div class=\"route-cell\"><span class=\"" + routeCls + "\">" + escapeHtml(item.route) + "</span>" +
             "<span class=\"destination-name\">" + escapeHtml(item.destination) + "</span></div>" +
           "<div class=\"distance-cell\" title=\"По прямій від поточної позиції транспорту\">" + distHtml + "</div>" +
           "<div class=\"time-cell\"><span class=\"time-scheduled\">" + escapeHtml(item.time) + "</span></div>" +
-          minutesHtml(item.remainingMinutes) +
+          minutesHtml(item.remainingMinutes, kdCell) +
         "</div>" +
         "<div class=\"trip-timeline-panel\" style=\"display:" + (open ? "block" : "none") + ";\">" +
           vehicleBar(veh) +
@@ -1652,9 +2185,13 @@ const CLIENT_JS = String.raw`
         "</div>" +
       "</div>";
     }).join("");
+    var kdChip = (dir.kdPredictions && dir.kdPredictions.length)
+      ? " <span class=\"kd-chip\" title=\"Прогнози відправлень за даними офіційного API «Київ Digital»\">≈ " +
+        dir.kdPredictions.map(function (m) { return m + " хв"; }).join(", ") + "</span>"
+      : "";
     return "<div class=\"board-card\">" +
       "<div class=\"card-header\"><span class=\"type-badge " + typeCls + "\">" + escapeHtml(dir.type) + "</span>" +
-        "<span class=\"platform-title\">" + escapeHtml(dir.title) + "</span></div>" +
+        "<span class=\"platform-title\">" + escapeHtml(dir.title) + "</span>" + kdChip + "</div>" +
       "<div class=\"table-columns\"><div>МАРШРУТ · НАПРЯМОК</div><div>ВІДСТАНЬ</div><div>ЧАС</div><div>ХВ.</div></div>" +
       "<div class=\"departure-list\">" + (rows || "<div style=\"padding:20px;text-align:center;color:#8b949e;\">Немає рейсів у розкладі</div>") + "</div>" +
       "<div class=\"card-footer\"><button class=\"show-all-btn\" type=\"button\" data-expand=\"" + escapeHtml(dir.key) + "\">" +
@@ -1680,6 +2217,7 @@ const CLIENT_JS = String.raw`
       departureGrid.innerHTML = noticeHtml("За офіційним розкладом КП «Київпастранс» на цю зупинку рейсів у найближчі 2 години не знайдено. Спробуйте іншу зупинку через пошук.");
       return;
     }
+    liveAssignMap = assignLiveVehicles(hub);
     departureGrid.innerHTML = hub.directions.map(cardHtml).join("");
   }
 
@@ -1722,6 +2260,7 @@ const CLIENT_JS = String.raw`
       .then(function (hub) {
         if (seq !== hubSeq) return;
         currentHub = hub;
+        hubFetchedAtMs = Date.now();
         if (hub.pending) {
           showStatus("Розклад ще завантажується, повторюю спробу...", "warn");
           scheduleRetry(3000);
@@ -1841,6 +2380,12 @@ const CLIENT_JS = String.raw`
   var rtByTrip = {};
   var rtByRoute = {};
   var vehRegistry = null;
+  // trip-key -> RT vehicle, rebuilt on every render (see assignLiveVehicles)
+  var liveAssignMap = {};
+  var hubFetchedAtMs = 0;
+  var LIVE_LATE_SLACK_MIN = 5;    // straight-line distance underestimates the road, allow this much lateness
+  var LIVE_EARLY_HORIZON_MIN = 25; // a vehicle waiting at the stop may serve a departure up to this far out
+  var LIVE_AVG_SPEED_M_PER_MIN = 333; // ~20 km/h commercial speed in the city
 
   function pbWalk(u8, cb) {
     var i = 0;
@@ -1946,30 +2491,62 @@ const CLIENT_JS = String.raw`
     return Math.hypot(dLat, dLon);
   }
 
-  /** Live vehicle for a departure. The municipal feed carries no trip_id, so
-   * exact trip matching is a fallback; the primary join is by route_id with
-   * the vehicle closest to the stop. Both are real GPS positions — nothing
-   * is invented, and an unmatched trip keeps its honest dashes. */
-  function liveVehicleFor(item) {
-    var veh = null;
-    var exact = rtByTrip[item.tripId];
-    if (exact) {
-      veh = exact;
-      veh.matched = "trip";
-    } else {
-      var cands = rtByRoute[item.routeId] || [];
-      var pos = item.originPos;
-      var best = null, bestD = Infinity;
-      cands.forEach(function (v) {
-        if (typeof v.lat !== "number" || !Number.isFinite(v.lat)) return;
-        if (!pos || !Number.isFinite(pos[0]) || !Number.isFinite(pos[1])) return;
-        var d = distMeters(v.lat, v.lon, pos[0], pos[1]);
-        if (d < bestD) { best = v; bestD = d; }
+  /** One-time assignment of GPS vehicles to departures, rebuilt per render.
+   * 1. An exact trip_id match (if the feed ever carries one) wins outright.
+   * 2. Otherwise each vehicle may claim at most ONE departure of its route —
+   *    the one closest in time to its arrival estimate (straight-line
+   *    distance / average commercial speed). Far-off departures get honest
+   *    dashes instead of a vehicle that obviously cannot serve them. */
+  function assignLiveVehicles(hub) {
+    var map = {};
+    if (!hub || !hub.directions || !hub.directions.length) return map;
+    var ageMin = hubFetchedAtMs ? (Date.now() - hubFetchedAtMs) / 60000 : 0;
+    var slots = [];
+    hub.directions.forEach(function (dir) {
+      (dir.departures || []).forEach(function (item) {
+        var key = dir.key + "|" + item.tripId + "|" + item.depAbs;
+        var veh = rtByTrip[item.tripId];
+        if (veh) { veh.matched = "trip"; map[key] = veh; return; }
+        slots.push({
+          key: key,
+          routeId: item.routeId,
+          depMin: Math.max(0, (item.remainingMinutes || 0) - ageMin),
+          originPos: item.originPos
+        });
       });
-      if (!best) return item.vehicle || null;
-      best.matched = "route";
-      veh = best;
-    }
+    });
+    Object.keys(rtByRoute).forEach(function (rid) {
+      var vehicles = rtByRoute[rid].filter(function (v) {
+        return typeof v.lat === "number" && Number.isFinite(v.lat);
+      });
+      var cand = slots.filter(function (s) {
+        return s.routeId === rid && !map[s.key] && s.originPos &&
+          Number.isFinite(s.originPos[0]) && Number.isFinite(s.originPos[1]);
+      });
+      if (!cand.length || !vehicles.length) return;
+      vehicles.forEach(function (v) {
+        var best = null, bestAbs = Infinity;
+        cand.forEach(function (s) {
+          if (map[s.key]) return;
+          var etaMin = distMeters(v.lat, v.lon, s.originPos[0], s.originPos[1]) / LIVE_AVG_SPEED_M_PER_MIN;
+          var diff = s.depMin - etaMin; // >0: the vehicle arrives early and waits; <0: it risks being late
+          if (diff < -LIVE_LATE_SLACK_MIN || diff > LIVE_EARLY_HORIZON_MIN) return;
+          var abs = Math.abs(diff);
+          if (abs < bestAbs) { bestAbs = abs; best = s; }
+        });
+        if (best) {
+          v.matched = "route";
+          map[best.key] = v;
+        }
+      });
+    });
+    return map;
+  }
+
+  /** Live vehicle for a departure row (pre-assigned by assignLiveVehicles). */
+  function liveVehicleFor(item, rowKey) {
+    var veh = (rowKey && liveAssignMap[rowKey]) || item.vehicle || null;
+    if (!veh) return null;
     var digits = String(veh.licensePlate || veh.label || "").match(/\d{3,}/);
     var reg = (digits && vehRegistry) ? vehRegistry[digits[0]] : null;
     var pos2 = item.originPos;
@@ -1980,13 +2557,16 @@ const CLIENT_JS = String.raw`
       model: reg ? reg.model : "—",
       isLowFloor: reg ? !!reg.lowFloor : false,
       matched: veh.matched,
-      distanceM: hasPos ? Math.round(distMeters(veh.lat, veh.lon, pos2[0], pos2[1])) : null
+      distanceM: hasPos ? Math.round(distMeters(veh.lat, veh.lon, pos2[0], pos2[1]))
+        : (typeof veh.distanceM === "number" ? veh.distanceM : null)
     };
   }
 
   function refreshLive() {
     var apply = function (vehicles) {
-      window.__RT = { applied: (vehicles || []).length, t: Date.now() };
+      window.__RT = window.__RT || {};
+      window.__RT.applied = (vehicles || []).length;
+      window.__RT.t = Date.now();
       rtByTrip = {};
       rtByRoute = {};
       (vehicles || []).forEach(function (v) {
@@ -1998,23 +2578,35 @@ const CLIENT_JS = String.raw`
       });
       if (currentHub && currentHub.directions) renderGrid();
     };
+    /* Last resort of the fallback chain: vehicles delivered by the server with
+     * the hub itself (official «Київ Digital» GPS, source 5). They carry
+     * routeId "<gtfsId>" or "kd:<kdId>" — both are matched by
+     * assignLiveVehicles exactly like the municipal feed vehicles. */
+    var kdLiveFallback = function () {
+      window.__RT = window.__RT || {};
+      window.__RT.kdFallback = true;
+      return (currentHub && currentHub.kdLive) || [];
+    };
     var serverFallback = function () {
       return fetchWithTimeout("/api/live", 8000)
-        .then(function (res) { return res.ok ? res.json() : []; })
-        .then(function (d) { return d.vehicles || []; })
-        .catch(function () { return []; });
+        .then(function (res) { return res.ok ? res.json() : {}; })
+        .then(function (d) { return (d.vehicles && d.vehicles.length) ? d.vehicles : kdLiveFallback(); })
+        .catch(kdLiveFallback);
     };
     // The GPS feed must never wait for the registry: they load in parallel,
     // and the registry re-renders the board once it finally resolves.
     var rt = fetch(RT_URL)
       .then(function (res) {
+        window.__RT = window.__RT || {};
         window.__RT.direct = res.status;
         if (!res.ok) throw new Error("HTTP " + res.status);
         return res.arrayBuffer();
       })
       .then(function (buf) {
         var parsed = parseRtFeed(new Uint8Array(buf));
+        window.__RT = window.__RT || {};
         window.__RT.parsed = parsed.length;
+        window.__RT.kdFallback = false;
         return parsed;
       })
       .catch(serverFallback);
