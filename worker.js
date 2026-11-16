@@ -878,7 +878,12 @@ function activeServiceIds(index, dayOffset = 0) {
   return set;
 }
 
-const ROUTE_TYPE_LABELS = { 0: "ТРАМ", 11: "ТРОЛ", 3: "АВТ", 1: "МЕТРО", 2: "ПОЇЗД" };
+// Type abbreviations per user convention: А - Автобус, Т - Трамвай,
+// ТР - Тролейбус, Ф - Фунікулер, М - Метро, CE - City Express.
+const ROUTE_TYPE_LABELS = { 0: "Т", 11: "ТР", 3: "А", 1: "М", 2: "CE", 7: "Ф" };
+// Cards of these types are physically platforms (metro/CE/funicular); for all
+// the rest the card header says "ЗУПИНКА".
+const PLATFORM_TYPE_KEYS = [1, 2, 7];
 const STOP_MODE_LABELS = { "1": "ТРАМ", "2": "ТРОЛ", "3": "АВТ" };
 
 /* ============================================================
@@ -992,10 +997,15 @@ function kdParseMinutes(s) {
 const KD_TIMELINE_MATCH_RADIUS_M = 250;
 const KD_TIMELINE_MAX_ROWS = 60;
 
+/** Word tokens of a raw name (NOT normalizeName — spacing is needed here). */
+function nameTokens(name) {
+  return String(name || "").toLowerCase().match(/[а-яіїєґa-z0-9]+/g) || [];
+}
+
 /** Direction path (array of [aId, name, lat, lng]) of a route whose terminus
  *  best matches the destination name, or null. */
 function kdPathForDestination(kd, routeNumber, destName) {
-  const dtoks = new Set(normalizeName(destName).match(/[а-яіїєґa-z0-9]+/g) || []);
+  const dtoks = new Set(nameTokens(destName));
   let best = null, bestScore = 0;
   for (const [kdId, meta] of Object.entries(kd.routes)) {
     if (String(meta[0]) !== String(routeNumber)) continue;
@@ -1004,7 +1014,7 @@ function kdPathForDestination(kd, routeNumber, destName) {
     for (const key of ["f", "b"]) {
       const path = p[key];
       if (!path || path.length < 2) continue;
-      const etoks = normalizeName(path[path.length - 1][1]).match(/[а-яіїєґa-z0-9]+/g) || [];
+      const etoks = nameTokens(path[path.length - 1][1]);
       let score = 0;
       for (const t of etoks) if (dtoks.has(t)) score++;
       if (score > bestScore) { bestScore = score; best = path; }
@@ -1016,12 +1026,12 @@ function kdPathForDestination(kd, routeNumber, destName) {
 /** Of the two directions of one KD route, the one whose terminus best matches
  *  the destination (fallback: forward, else backward). */
 function kdPickDirection(p, destName) {
-  const dtoks = new Set(normalizeName(destName || "").match(/[а-яіїєґa-z0-9]+/g) || []);
+  const dtoks = new Set(nameTokens(destName));
   let best = null, bestScore = 0;
   for (const key of ["f", "b"]) {
     const path = p[key];
     if (!path || path.length < 2) continue;
-    const etoks = normalizeName(path[path.length - 1][1]).match(/[а-яіїєґa-z0-9]+/g) || [];
+    const etoks = nameTokens(path[path.length - 1][1]);
     let score = 0;
     for (const t of etoks) if (dtoks.has(t)) score++;
     if (score > bestScore) { bestScore = score; best = path; }
@@ -1115,17 +1125,17 @@ function kdBuildTimeline(path, seq, stopPosById, stopNameById) {
  *  list of the line. Works from the bundled asset only — no KD_TOKEN needed. */
 function enrichTimelinesFromKd(kd, hub, index, stopPosById, stopNameById) {
   if (!kd.paths || !hub.directions) return;
+  const pathCache = {}; // "route>destination" -> KD direction path
   for (const dir of hub.directions) {
-    const rows0 = dir.departures && dir.departures[0];
-    if (!rows0) continue;
-
     if (dir.kdOnly) continue; // KD-only timelines are attached at creation time (see below)
-
-    const path = kdPathForDestination(kd, dir.departures[0].route, dir.departures[0].destination);
-    if (!path) continue;
+    // Cards group several routes of one physical stop, so the path is
+    // resolved per row (route + destination), not per card.
     for (const d of dir.departures) {
       const seq = index && index.tripStops && index.tripStops[d.tripId];
       if (!seq) continue;
+      const pk = d.route + ">" + d.destination;
+      const path = pathCache[pk] !== undefined ? pathCache[pk] : (pathCache[pk] = kdPathForDestination(kd, d.route, d.destination));
+      if (!path) continue;
       const full = kdBuildTimeline(path, seq, stopPosById, stopNameById);
       if (full) d.stops = full;
     }
@@ -1136,8 +1146,25 @@ function enrichTimelinesFromKd(kd, hub, index, stopPosById, stopNameById) {
  * HUB RESOLVER — official schedule board for any stop
  * ============================================================ */
 
+/** Matching key for stop names. Quotes, dots and ALL whitespace are removed;
+ *  common street-type words are folded to their official abbreviation BEFORE
+ *  that, so "Дніпровська набережна" (KD/full spelling) == "Дніпровська наб."
+ *  (GTFS spelling), "станція метро" == "ст.м." etc. Used for name
+ *  equality/substring matching only — the original spelling is displayed. */
+const NAME_ABBREVIATIONS = [
+  [/станці[а-яіїєґ']*\s+метро/g, "стм"],
+  [/набережна/g, "наб"],
+  [/бульвар/g, "бул"],
+  [/бульв/g, "бул"],
+  [/проспект/g, "просп"],
+  [/вулиця/g, "вул"],
+  [/площа/g, "пл"]
+];
+
 function normalizeName(str) {
-  return String(str || "").toLowerCase().replace(/[«»"'„“]/g, "").replace(/\s+/g, " ").trim();
+  let s = String(str || "").toLowerCase();
+  for (const [re, abbr] of NAME_ABBREVIATIONS) s = s.replace(re, abbr);
+  return s.replace(/[«»"'„“.\s]/g, "");
 }
 
 function distanceMeters(lat1, lon1, lat2, lon2) {
@@ -1149,9 +1176,11 @@ function distanceMeters(lat1, lon1, lat2, lon2) {
 /**
  * Free-text query -> { title, stopIds }:
  * 1. exact/substring name match in GTFS control points (busiest name wins),
- * 2. else ІАС «Майно» point -> all GTFS stops within 250 m (then 500 m).
+ * 2. else ІАС «Майно» point -> all GTFS stops within 250 m (then 500 m),
+ * 3. else KD stop registry (bundled asset) -> nearby GTFS stops by
+ *    coordinates — KD spellings sometimes differ from both GTFS and «Майно».
  */
-async function resolveTargetStops(index, query, ctx = null) {
+async function resolveTargetStops(index, query, ctx = null, env = null) {
   const q = normalizeName(query);
   if (!q) return null;
 
@@ -1167,7 +1196,7 @@ async function resolveTargetStops(index, query, ctx = null) {
     let best = null, bestScore = -1;
     for (const [name, stops] of Object.entries(pool)) {
       const score = stops.reduce((acc, s) => acc + (index.sched[s[0]] || []).length, 0);
-      if (score > bestScore) { bestScore = score; best = { title: name, stopIds: stops.map(s => s[0]) }; }
+      if (score > bestScore) { bestScore = score; best = { title: name, stopIds: stops.map(s => s[0]), query }; }
     }
     return best;
   };
@@ -1185,7 +1214,29 @@ async function resolveTargetStops(index, query, ctx = null) {
     for (const radius of [CONFIG.NEARBY_STOP_RADIUS_M, 500]) {
       const nearby = index.stops
         .filter(s => s[2] && s[3] && distanceMeters(maynoMatch[1], maynoMatch[2], s[2], s[3]) <= radius);
-      if (nearby.length > 0) return { title: maynoMatch[0], stopIds: nearby.map(s => s[0]) };
+      if (nearby.length > 0) return { title: maynoMatch[0], stopIds: nearby.map(s => s[0]), query };
+    }
+  }
+
+  // 3. KD stop registry fallback (asset only, zero API calls). Exact name
+  //    match wins over substring; the KD coordinates are mapped to nearby
+  //    GTFS stops with the same radii as the «Майно» branch.
+  const kd = await loadKdIndex(env);
+  if (kd && Array.isArray(kd.stops)) {
+    let kdHit = null;
+    for (const s of kd.stops) {
+      if (!s[2] || !s[3]) continue;
+      const nameNorm = normalizeName(s[1]);
+      const kind = nameNorm === q ? 0 : nameNorm.includes(q) ? 1 : -1;
+      if (kind < 0) continue;
+      if (!kdHit || kind < kdHit.kind) kdHit = { name: s[1], lat: s[2], lng: s[3], kind };
+    }
+    if (kdHit) {
+      for (const radius of [CONFIG.NEARBY_STOP_RADIUS_M, 500]) {
+        const nearby = index.stops
+          .filter(s => s[2] && s[3] && distanceMeters(kdHit.lat, kdHit.lng, s[2], s[3]) <= radius);
+        if (nearby.length > 0) return { title: kdHit.name, stopIds: nearby.map(s => s[0]), query };
+      }
     }
   }
   return null;
@@ -1228,6 +1279,23 @@ function refreshHubTimes(hub) {
   return out;
 }
 
+/** Card header, shared by schedule and KD-only cards:
+ *  "ЗУПИНКА · А (НАПРЯМОК: X)" / "ЗУПИНКА · А, ТР (НАПРЯМКИ: X, Y +2)".
+ *  The word ПЛАТФОРМА is reserved for metro / City Express / funicular. */
+function buildCardTitle(typeKeys, destsUpper) {
+  const labels = [...new Set(typeKeys.map(t => ROUTE_TYPE_LABELS[t] || "ТРАНЗ"))];
+  const word = typeKeys.length && typeKeys.every(t => PLATFORM_TYPE_KEYS.includes(t)) ? "ПЛАТФОРМА" : "ЗУПИНКА";
+  let destPart;
+  if (destsUpper.length <= 1) {
+    destPart = "(НАПРЯМОК: " + (destsUpper[0] || "КІНЕЦЕВА") + ")";
+  } else {
+    const shown = destsUpper.slice(0, 2);
+    const rest = destsUpper.length - shown.length;
+    destPart = "(НАПРЯМКИ: " + shown.join(", ") + (rest > 0 ? " +" + rest : "") + ")";
+  }
+  return { title: word + " · " + labels.join(", ") + " " + destPart, type: labels.join(", ") };
+}
+
 async function buildHub(hubKey, ctx, env) {
   const kyivTimeStr = kyivTimeString();
   const slug = hubKey.toLowerCase().replace(/\s+/g, "-");
@@ -1236,7 +1304,7 @@ async function buildHub(hubKey, ctx, env) {
     return { hubKey: slug, title: "Київ, " + hubKey, kyivTime: kyivTimeStr, directions: [], unavailable: true };
   }
 
-  const target = await resolveTargetStops(index, hubKey, ctx);
+  const target = await resolveTargetStops(index, hubKey, ctx, env);
   if (!target) {
     return { hubKey: slug, title: "Київ, " + hubKey, kyivTime: kyivTimeStr, directions: [], stale: !!index.stale };
   }
@@ -1278,24 +1346,58 @@ async function buildHub(hubKey, ctx, env) {
   }
   const upcoming = [...picked.values()].sort((a, b) => a.abs - b.abs);
 
+  // Physical-stop clustering of the resolved platforms: GTFS has a separate
+  // stop record for every route on the same curb (duplicates sit 1–17 m apart,
+  // opposite curbs 30 m+), so different routes arriving at ONE stop share a
+  // single card. Two records merge when they sit within
+  // STOP_CLUSTER_RADIUS_M of each other AND serve different route ids — a
+  // route's own records are its direction pair and keep separate cards.
+  const STOP_CLUSTER_RADIUS_M = 25;
+  const routesOfStop = {};
+  for (const stopId of target.stopIds) {
+    const set = new Set();
+    for (const pair of (index.sched[stopId] || [])) {
+      const trip = index.trips[pair[1]];
+      if (trip) set.add(trip.r);
+    }
+    routesOfStop[stopId] = set;
+  }
+  const clusters = [];
+  const clusterOf = {}; // stopId -> cluster key
+  for (const stopId of target.stopIds) {
+    const pos = stopPosById[stopId];
+    if (!pos || !Number.isFinite(pos[0])) { clusterOf[stopId] = "solo:" + stopId; continue; }
+    let home = null;
+    for (const c of clusters) {
+      if (distanceMeters(c.pos[0], c.pos[1], pos[0], pos[1]) > STOP_CLUSTER_RADIUS_M) continue;
+      let sharesRoute = false;
+      for (const r of routesOfStop[stopId]) if (c.routes.has(r)) { sharesRoute = true; break; }
+      if (!sharesRoute) { home = c; break; }
+    }
+    if (!home) { home = { pos, ids: [], routes: new Set() }; clusters.push(home); }
+    home.ids.push(stopId);
+    for (const r of routesOfStop[stopId]) home.routes.add(r);
+    clusterOf[stopId] = "c" + (clusters.indexOf(home) + 1);
+  }
+
+  // One card per PHYSICAL stop cluster (rows carry route + destination + time).
   const groups = {};
   for (const d of upcoming) {
     const route = index.routes[d.trip.r] || { n: d.trip.r, t: -1, l: "" };
     const destStopId = index.dest[d.tripId] || "";
     const destName = stopNameById[destStopId] || route.l || "Кінцева зупинка";
-    const key = d.trip.r + ">" + destStopId;
+    const key = "@" + (clusterOf[d.originStopId] || d.originStopId);
 
     if (!groups[key]) {
-      const type = ROUTE_TYPE_LABELS[route.t] || "ТРАНЗ";
       groups[key] = {
         id: "plat-" + Object.keys(groups).length,
         key,
-        title: "ПЛАТФОРМА · " + type + " (НАПРЯМОК: " + destName.toUpperCase() + ")",
-        type,
-        typeKey: route.t,
+        stopId: d.originStopId,
+        typeKeys: [],
         departures: []
       };
     }
+    if (!groups[key].typeKeys.includes(route.t)) groups[key].typeKeys.push(route.t);
 
     // Live vehicle — only when the realtime feed reports THIS trip.
     let vehicle = null;
@@ -1342,11 +1444,24 @@ async function buildHub(hubKey, ctx, env) {
     });
   }
 
-  const directions = Object.values(groups).map(g => {
-    g.departures.sort((a, b) => a.depAbs - b.depAbs);
-    g.departures = g.departures.slice(0, CONFIG.MAX_DEPARTURES_PER_CARD);
-    return g;
-  });
+/** Titles need the whole card (types + destinations of all its rows), so they
+ *  are computed after grouping. */
+const directions = Object.values(groups).map(g => {
+  g.departures.sort((a, b) => a.depAbs - b.depAbs);
+  const dests = [];
+  for (const d of g.departures) {
+    const dn = d.destination.toUpperCase();
+    if (!dests.includes(dn)) dests.push(dn);
+  }
+  g.departures = g.departures.slice(0, CONFIG.MAX_DEPARTURES_PER_CARD);
+
+  const meta = buildCardTitle(g.typeKeys, dests);
+  g.type = meta.type;
+  g.typeKey = g.typeKeys[0];
+  g.typeKeys = g.typeKeys.filter(t => ROUTE_TYPE_LABELS[t]); // drop unknown types from tooltip data
+  g.title = meta.title;
+  return g;
+});
 
   const hub = {
     hubKey: target.stopIds[0],
@@ -1395,6 +1510,8 @@ async function enrichHubWithKd(hub, target, stopPosById, stopNameById, index, ct
     // 1) coordinate match GTFS platform -> KD stop (the registries differ)
     const aIds = [];
     const seenA = new Set();
+    const kdPosById = {}; // aId -> [lat, lng] — exact KD stop positions
+    for (const s of kd.stops) kdPosById[s[0]] = [s[2], s[3]];
     for (const stopId of target.stopIds) {
       const pos = stopPosById[stopId];
       if (!pos || !Number.isFinite(pos[0])) continue;
@@ -1408,11 +1525,23 @@ async function enrichHubWithKd(hub, target, stopPosById, stopNameById, index, ct
         aIds.push(best[0]);
       }
     }
+    // Name fallback: a GTFS platform can sit far from the KD stop of the same
+    // name (or the name resolves only via the KD registry) — a KD stop whose
+    // normalized name equals the query IS the stop the user asked for, so its
+    // official KD predictions must still reach the board.
+    if (!aIds.length && target.query) {
+      const q = normalizeName(target.query);
+      for (const s of kd.stops) {
+        if (!s[2] || !s[3]) continue;
+        if (normalizeName(s[1]) === q && !seenA.has(s[0])) { seenA.add(s[0]); aIds.push(s[0]); }
+      }
+    }
     if (!aIds.length) return;
 
     // 2) forecasts: one batched call
     const tablo = await withDeadline(kdTablo(env, aIds), CONFIG.KD_TIMEOUT_MS + 500, {});
     const predsByNumber = {}; // number -> [{kdId, minutes: [..]}]
+    const predsByStop = {};   // aId -> [{kdId, num, minutes}] for grouped KD-only cards
     const kdIds = new Set();
     for (const aId of Object.keys(tablo || {})) {
       for (const kdId of Object.keys(tablo[aId] || {})) {
@@ -1423,19 +1552,19 @@ async function enrichHubWithKd(hub, target, stopPosById, stopNameById, index, ct
         if (!minutes.length) continue;
         kdIds.add(kdId);
         (predsByNumber[meta[0]] ||= []).push({ kdId, minutes });
+        (predsByStop[aId] ||= []).push({ kdId, num: String(meta[0]), minutes });
       }
     }
     if (!kdIds.size) return;
 
-    // 3) row-level attach + forecast chips on schedule cards
+    // 3) row-level attach + forecast chips on schedule cards (cards group
+    //    several routes of one physical stop, so the chip unions all numbers)
     const numbersInHub = new Set();
     for (const dir of hub.directions) {
-      const num = dir.departures[0] ? String(dir.departures[0].route) : null;
-      const list = num ? predsByNumber[num] : null;
-      if (list) {
-        const flat = [...new Set(list.flatMap(p => p.minutes))].sort((a, b) => a - b);
-        if (flat.length) dir.kdPredictions = flat;
-      }
+      const nums = [...new Set(dir.departures.map(d => String(d.route)))];
+      const flat = [...new Set(nums.flatMap(n => (predsByNumber[n] || []).flatMap(p => p.minutes)))]
+        .sort((a, b) => a - b);
+      if (flat.length) dir.kdPredictions = flat;
       for (const d of dir.departures) {
         numbersInHub.add(String(d.route));
         const plist = predsByNumber[String(d.route)];
@@ -1447,14 +1576,31 @@ async function enrichHubWithKd(hub, target, stopPosById, stopNameById, index, ct
       }
     }
 
-    // 4) KD-only cards for numbers the schedule board does not show
+    // 4) KD-only cards, one per physical KD stop (all its routes' forecasts in
+    //    a single card, rows sorted by remaining minutes). The same route can
+    //    appear in the tablo of two nearby stops — it keeps exactly one card
+    //    (first stop wins) so the client's one-vehicle-one-trip matcher sees
+    //    each routeId once.
     const originPos = stopPosById[target.stopIds[0]] || null;
     const kdOnlyPaths = {}; // kdId -> {path, rows} for the "current" GPS mark
-    for (const [num, list] of Object.entries(predsByNumber)) {
-      if (numbersInHub.has(num)) continue;
-      for (const p of list) {
-        const meta = kd.routes[p.kdId] || [num, 3, num];
-        const type = ROUTE_TYPE_LABELS[meta[1]] || "ТРАНЗ";
+    const seenKd = new Set();
+    for (const aId of aIds) {
+      const list = predsByStop[aId];
+      if (!list) continue;
+      const rowsSpec = list.filter(p => !numbersInHub.has(p.num) && !seenKd.has(p.kdId));
+      if (!rowsSpec.length) continue;
+      rowsSpec.forEach(p => seenKd.add(p.kdId));
+
+      const typeKeys = [...new Set(rowsSpec.map(p => kd.routes[p.kdId][1]))];
+      const dests = [];
+      for (const p of rowsSpec) {
+        const dn = String(kd.routes[p.kdId][2]).toUpperCase();
+        if (!dests.includes(dn)) dests.push(dn);
+      }
+      const meta = buildCardTitle(typeKeys, dests);
+      const departures = [];
+      for (const p of rowsSpec) {
+        const meta = kd.routes[p.kdId];
         // timeline: full line path from the asset; times are not published for
         // these routes (the app shows countdowns only) — honest dashes
         let kdRows = null, kdPath = null;
@@ -1465,32 +1611,38 @@ async function enrichHubWithKd(hub, target, stopPosById, stopNameById, index, ct
             kdRows = kdPath.map((s, i) => ({ name: s[1], time: null, status: i === kdPath.length - 1 ? "destination" : "intermediate" }));
           }
         }
-        hub.directions.push({
-          id: "kd-" + p.kdId,
-          key: "kd:" + p.kdId,
-          title: "ПЛАТФОРМА · " + type + " (ЗА ПРОГНОЗОМ КИЇВ DIGITAL: " + String(meta[2]).toUpperCase() + ")",
-          type,
-          typeKey: meta[1],
-          kdOnly: true,
-          kdPredictions: p.minutes,
-          departures: p.minutes.map((m, i) => ({
-            tripId: "kd" + p.kdId + "-" + i,
+        if (kdPath && kdRows) kdOnlyPaths[p.kdId] = { path: kdPath, rows: kdRows };
+        for (const m of p.minutes) {
+          departures.push({
+            tripId: "kd" + p.kdId + "-" + m,
+            kdId: p.kdId,
             routeId: "kd:" + p.kdId,
-            route: num,
+            route: p.num,
             destination: meta[2],
             time: "≈" + formatGtfsTime(nowSec + m * 60),
             depAbs: nowSec + m * 60,
-            originPos,
+            originPos: kdPosById[p.kdId] || originPos,
             delayMin: 0,
             remainingMinutes: m,
             kdMinutes: m,
             kdOnly: true,
             vehicle: null,
             stops: kdRows ? kdRows.map(r => ({ ...r })) : []
-          }))
-        });
-        if (kdPath && kdRows) kdOnlyPaths[p.kdId] = { path: kdPath, rows: kdRows };
+          });
+        }
       }
+      departures.sort((a, b) => a.remainingMinutes - b.remainingMinutes);
+      hub.directions.push({
+        id: "kd-" + aId,
+        key: "kdstop:" + aId,
+        title: meta.title,
+        type: meta.type,
+        typeKey: typeKeys[0],
+        typeKeys,
+        kdOnly: true,
+        kdPredictions: departures.map(d => d.remainingMinutes),
+        departures
+      });
     }
 
     // 5) GPS: one batched call for the routes with forecasts (cap = API limit)
@@ -1547,15 +1699,22 @@ async function enrichHubWithKd(hub, target, stopPosById, stopNameById, index, ct
         });
       }
 
-      // pair vehicles with the KD-only rows (eta vs forecast, one-to-one)
-      const kdDir = hub.directions.find(d => d.key === "kd:" + kdId);
-      if (kdDir && originPos) {
+      // pair vehicles with the KD-only rows of THIS route (eta vs forecast,
+      // one-to-one); rows of one route can live in a grouped KD-only card
+      const kdRows = [];
+      for (const dir of hub.directions) {
+        if (!dir.kdOnly) continue;
+        for (const row of dir.departures) if (row.kdId === kdId) kdRows.push(row);
+      }
+      if (kdRows.length) {
         const used = new Set();
-        for (const row of kdDir.departures) {
+        for (const row of kdRows) {
+          const rowPos = row.originPos || originPos;
+          if (!rowPos) continue;
           let best = null, bestDiff = Infinity;
           vehs.forEach((v, i) => {
             if (used.has(i)) return;
-            const eta = distanceMeters(v.lat, v.lng, originPos[0], originPos[1]) / CONFIG.KD_AVG_SPEED_M_PER_MIN;
+            const eta = distanceMeters(v.lat, v.lng, rowPos[0], rowPos[1]) / CONFIG.KD_AVG_SPEED_M_PER_MIN;
             const diff = Math.abs(eta - row.remainingMinutes);
             if (diff < bestDiff) { bestDiff = diff; best = i; }
           });
@@ -1570,20 +1729,16 @@ async function enrichHubWithKd(hub, target, stopPosById, stopNameById, index, ct
               matched: "route",
               lat: v.lat,
               lon: v.lng,
-              distanceM: Math.round(distanceMeters(v.lat, v.lng, originPos[0], originPos[1]))
+              distanceM: Math.round(distanceMeters(v.lat, v.lng, rowPos[0], rowPos[1]))
             };
           }
         }
-        // mark the stop nearest to the vehicle as current on the KD timeline
+        // mark the stop nearest to the vehicle as current on its KD timeline
         const kdInfo = kdOnlyPaths[kdId];
-        const vehRow = kdDir.departures.find(x => x.vehicle && typeof x.vehicle.lat === "number");
+        const vehRow = kdRows.find(x => x.vehicle && typeof x.vehicle.lat === "number");
         if (kdInfo && vehRow) {
           const vi = kdNearestPathIdx(kdInfo.path, vehRow.vehicle.lat, vehRow.vehicle.lon, KD_TIMELINE_MATCH_RADIUS_M);
-          if (vi >= 0) {
-            for (const d of kdDir.departures) {
-              if (d.stops && d.stops[vi]) d.stops[vi].status = "current";
-            }
-          }
+          if (vi >= 0 && vehRow.stops && vehRow.stops[vi]) vehRow.stops[vi].status = "current";
         }
       }
     }
@@ -1600,7 +1755,7 @@ async function enrichHubWithKd(hub, target, stopPosById, stopNameById, index, ct
 async function resolveHubDepartures(query, ctx = null, env = null) {
   const hubKey = String(query || "").trim() || CONFIG.DEFAULT_STOP;
   const memoKey = normalizeName(hubKey);
-  const cacheKey = new Request("https://kpt-cache.internal/api/hub/v6/" + encodeURIComponent(memoKey));
+  const cacheKey = new Request("https://kpt-cache.internal/api/hub/v7/" + encodeURIComponent(memoKey));
 
   const m = hubMemo.get(memoKey);
   if (m && m.until > Date.now()) return refreshHubTimes(m.hub);
@@ -1846,6 +2001,7 @@ const PAGE_CSS =
     '.type-badge.metro { background: #16a34a; }' +
     '.type-badge.train { background: #2563eb; }' +
     '.type-badge.trolley { background: #8b5cf6; }' +
+    '.type-badge.funicular { background: #0d9488; }' +
     '.platform-title {' +
       'font-size: 1.12rem;' +
       'font-weight: 800;' +
@@ -1903,6 +2059,7 @@ const PAGE_CSS =
     '.route-badge.train { background: #2563eb; }' +
     '.route-badge.tram { background: #d97706; }' +
     '.route-badge.trolley { background: #8b5cf6; }' +
+    '.route-badge.funicular { background: #0d9488; }' +
     '.destination-name {' +
       'font-weight: 700;' +
       'font-size: 0.98rem;' +
@@ -2060,7 +2217,8 @@ const CLIENT_JS = String.raw`
 (function () {
   "use strict";
   var BOOT = __BOOT__;
-  var ROUTE_TYPE_CLASSES = { 0: "tram", 11: "trolley", 3: "bus", 1: "metro", 2: "train" };
+  var ROUTE_TYPE_CLASSES = { 0: "tram", 11: "trolley", 3: "bus", 1: "metro", 2: "train", 7: "funicular" };
+  var ROUTE_TYPE_NAMES = { 0: "Трамвай", 11: "Тролейбус", 3: "Автобус", 1: "Метро", 2: "City Express", 7: "Фунікулер" };
   var HUB_TIMEOUT_MS = 20000;
   var SEARCH_TIMEOUT_MS = 8000;
 
@@ -2163,6 +2321,7 @@ const CLIENT_JS = String.raw`
     var isExp = !!expanded[dir.key];
     var visible = isExp ? deps : deps.slice(0, 3);
     var typeCls = ROUTE_TYPE_CLASSES[dir.typeKey] || "bus";
+    var typeNames = (dir.typeKeys || [dir.typeKey]).map(function (t) { return ROUTE_TYPE_NAMES[t]; }).filter(Boolean).join(", ");
     var routeCls = "route-badge" + (typeCls !== "bus" ? " " + typeCls : "");
     var rows = visible.map(function (item) {
       var key = dir.key + "|" + item.tripId + "|" + item.depAbs;
@@ -2190,7 +2349,7 @@ const CLIENT_JS = String.raw`
         dir.kdPredictions.map(function (m) { return m + " хв"; }).join(", ") + "</span>"
       : "";
     return "<div class=\"board-card\">" +
-      "<div class=\"card-header\"><span class=\"type-badge " + typeCls + "\">" + escapeHtml(dir.type) + "</span>" +
+      "<div class=\"card-header\"><span class=\"type-badge " + typeCls + "\"" + (typeNames ? " title=\"" + escapeHtml(typeNames) + "\"" : "") + ">" + escapeHtml(dir.type) + "</span>" +
         "<span class=\"platform-title\">" + escapeHtml(dir.title) + "</span>" + kdChip + "</div>" +
       "<div class=\"table-columns\"><div>МАРШРУТ · НАПРЯМОК</div><div>ВІДСТАНЬ</div><div>ЧАС</div><div>ХВ.</div></div>" +
       "<div class=\"departure-list\">" + (rows || "<div style=\"padding:20px;text-align:center;color:#8b949e;\">Немає рейсів у розкладі</div>") + "</div>" +
